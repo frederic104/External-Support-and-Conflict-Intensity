@@ -34,7 +34,7 @@ files:
   # These paths describe the files currently present in data/raw.  They are
   # inspected by the preflight gate below; presence does not authorize a
   # cross-version merge.
-  dyadic: "data/raw/ucdp/Dyadic_v26_1.csv"
+  dyadic: "data/raw/ucdp/ucdp-dyadic-181.csv"
   esd_ty: "data/raw/ucdp/ucdp-esd-ty-181.csv"
   # Required source not currently present; do not derive it from TY.
   esd_dy: "data/raw/ucdp/ucdp-esd-dy-181.csv"
@@ -56,7 +56,7 @@ files:
 # Set these only after placing a same-version source set (or an official,
 # validated ID translation table) in data/raw.
 ucdp_versions:
-  dyadic: "26.1"
+  dyadic: "18.1"
   esd_ty: "18.1"
   esd_dy: "18.1"
   id_translation: null
