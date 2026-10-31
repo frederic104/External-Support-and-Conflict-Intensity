@@ -253,7 +253,8 @@ def fit_predictive_models(
                 shap_values = shap_values[-1]
             shap_frame = pd.DataFrame(shap_values, columns=features)
             shap_frame.insert(0, "dyad_id", test["dyad_id"].to_numpy())
-            shap_frame.insert(1, "year", test["year"].to_numpy())
+            if "year" not in shap_frame.columns:
+                shap_frame.insert(1, "year", test["year"].to_numpy())
             shap_frame.to_csv(output_dir / "xgboost_shap_values.csv", index=False)
             shap_importance = pd.DataFrame({
                 "feature": features,
