@@ -152,6 +152,8 @@ python src/analyze_models.py
 The script fits M0–M4 Logistic Regression models with dyad-clustered standard errors, then fits Random Forest and XGBoost models using the M4 feature set and a time-ordered test split beginning in 2009. It writes coefficients, odds ratios, model metrics, tree feature importance, XGBoost SHAP values, and a run summary to `reports/model_analysis/`. The default model dataset uses confirmed support; run the same command with `--dataset data/processed/model_dataset_all_recorded_support_sensitivity.csv` for the alleged-support sensitivity analysis.
 
 The tree models are predictive supplements, not causal estimators. Missing rows are excluded per model's complete-case sample; no outcome or control value is imputed by this script.
+
+The analysis also writes publication-style PDF and PNG figures: logistic odds-ratio forest plots, time-ordered predictive performance, tree feature importance, and XGBoost SHAP importance. The duplicate `year` column is de-duplicated during model-sample construction.
 - `data/interim/`: standardized source extracts and support feature table
 - `reports/data_audit/`: region decisions, sample flow, schema profile, duplicate keys, unmatched IDs, ESD DY/TY discrepancies, crosswalk issues, missingness, and run summary
 
