@@ -1,0 +1,60 @@
+# Copy to source_manifest.yaml and fill with the exact files downloaded for the project.
+sources:
+  ucdp_dyadic:
+    version: "18.1"
+    unit: "dyad-year"
+    official_url: "https://ucdp.uu.se/downloads/olddw.html"
+    codebook_url: "https://ucdp.uu.se/downloads/dyadic/ucdp-dyadic-181.pdf"
+    citation: "Harbom, Melander & Wallensteen (2008); Eck & Pettersson (2018); UCDP Dyadic Dataset v18.1 codebook."
+    downloaded_on: "YYYY-MM-DD"
+    sha256: ""
+  ucdp_esd_ty:
+    version: "18.1"
+    unit: "supporter-recipient-opponent-year"
+    official_url: "https://ucdp.uu.se/downloads/"
+    codebook_url: "https://ucdp.uu.se/downloads/extsup/ESD/ucdp-esd-181.pdf"
+    citation: "Meier, Karlén, Pettersson & Croicu (2023), Journal of Peace Research, DOI: 10.1177/00223433221079864."
+    downloaded_on: "YYYY-MM-DD"
+    sha256: ""
+  ucdp_esd_dy:
+    version: "18.1"
+    unit: "dyad-year"
+    official_url: "https://ucdp.uu.se/downloads/"
+    codebook_url: "https://ucdp.uu.se/downloads/extsup/ESD/ucdp-esd-181.pdf"
+    downloaded_on: "YYYY-MM-DD"
+    sha256: ""
+  ucdp_brd_dyadic:
+    version: "18.1"
+    unit: "dyad-year"
+    official_url: "https://ucdp.uu.se/downloads/olddw.html"
+    citation: "UCDP Battle-Related Deaths Dataset v18.1, dyadic format; record the exact release citation from its version documentation."
+    downloaded_on: "YYYY-MM-DD"
+    sha256: ""
+  cow_nmc:
+    version: "7.0"
+    official_url: "https://correlatesofwar.org/data-sets/national-material-capabilities/"
+    downloaded_on: "YYYY-MM-DD"
+    sha256: ""
+  world_bank_wdi:
+    version: "record release/access date"
+    official_url: "https://databank.worldbank.org/source/world-development-indicators"
+    downloaded_on: "YYYY-MM-DD"
+    sha256: ""
+  vdem:
+    version: "16"
+    official_url: "https://www.v-dem.net/data/the-v-dem-dataset/"
+    downloaded_on: "YYYY-MM-DD"
+    sha256: ""
+  cow_formal_alliances:
+    version: "4.1"
+    unit: "state alliance member/dyad/directed-dyad; select format explicitly"
+    official_url: "https://correlatesofwar.org/data-sets/formal-alliances/"
+    downloaded_on: "YYYY-MM-DD"
+    sha256: ""
+  cow_dyadic_mid:
+    version: "4.03"
+    unit: "state dyad-year"
+    official_url: "https://correlatesofwar.org/data-sets/mids/"
+    citation: "Maoz et al. (2018), The Dyadic Militarized Interstate Disputes (MIDs) Dataset Version 3.0; verify the exact citation appropriate to the downloaded 4.03 file."
+    downloaded_on: "YYYY-MM-DD"
+    sha256: ""

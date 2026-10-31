@@ -1,0 +1,110 @@
+project:
+  name: "External Support and Conflict Intensity in the Levant, Iraq, and Yemen"
+  base_year_start: 1975       # include the lag year needed for the first outcome year
+  outcome_year_start: 1976
+  outcome_year_end: 2017
+  main_conflict_types: [3, 4] # UCDP Dyadic v18.1: internal, internationalized internal
+  region_country_labels:
+    - Israel
+    - Palestine
+    - Jordan
+    - Lebanon
+    - Syria
+    - Iraq
+    - Yemen
+  # Exact, auditable string aliases only; no fuzzy matching.
+  country_aliases:
+    "syrian arab republic": "syria"
+    "syria, arab republic": "syria"
+    "republic of iraq": "iraq"
+    "republic of yemen": "yemen"
+    "yemen, republic of": "yemen"
+    "state of palestine": "palestine"
+    "west bank and gaza": "palestine"
+    "occupied palestinian territory": "palestine"
+  require_consecutive_active_dyad_years: true
+  # Main exposure definition prioritizes confirmed support. Alleged support is a sensitivity analysis.
+  support_main_definition: "confirmed"
+  alleged_support_sensitivity: true
+  # Main analysis treats UCDP Dyadic v18.1 as the source of truth for outcomes and IDs.
+  ucdp_version: "18.1"
+  use_location_fallback_for_region: false
+
+files:
+  # These paths describe the files currently present in data/raw.  They are
+  # inspected by the preflight gate below; presence does not authorize a
+  # cross-version merge.
+  dyadic: "data/raw/ucdp/Dyadic_v26_1.csv"
+  esd_ty: "data/raw/ucdp/ucdp-esd-ty-181.csv"
+  # Required source not currently present; do not derive it from TY.
+  esd_dy: "data/raw/ucdp/ucdp-esd-dy-181.csv"
+  # The available file is conflict-level, so it is deliberately not configured
+  # as the dyadic BRD robustness outcome.
+  brd_dyadic: null
+  country_crosswalk: "data/templates/country_crosswalk.csv"
+  # Official downloads are kept in their source format. pipeline.py normalizes
+  # these files to country-year form only after the time-aware crosswalk matches.
+  nmc: "data/raw/cow/NMC-70-abridged.csv"
+  wdi: "data/raw/world_bank/WDICSV.csv"
+  vdem: "data/raw/vdem/V-Dem-CY-Core-v16.csv"
+  output_dir: "data/processed"
+  interim_dir: "data/interim"
+  audit_dir: "reports/data_audit"
+
+# Core UCDP identifiers must refer to the same release.  The current raw
+# directory has ESD 18.1 but Dyadic 26.1, so preflight stops before any join.
+# Set these only after placing a same-version source set (or an official,
+# validated ID translation table) in data/raw.
+ucdp_versions:
+  dyadic: "26.1"
+  esd_ty: "18.1"
+  esd_dy: "18.1"
+  id_translation: null
+
+missingness_policy:
+  dyadic_outcome:
+    sentinel_values: [-99, -999, -9999]
+    action: "exclude from supervised outcome sample and log; never impute the outcome"
+  esd_support:
+    action: "only interpret ext_sup=0 as no recorded support; missing ext_sup or an absent ESD DY key is an audit issue, not zero"
+    blank_detail_fields_when_no_support: "set support-type dummies to zero only when the matching ESD DY row explicitly has ext_sup=0"
+    active_flag: "active must be binary and observed; active=0 is excluded from exposure construction; missing/non-binary status is a hard audit error"
+    supported_ty_details: "supported TY rows must have binary ext_alleged and expected type flags; unexpected missingness is audited and stops the pipeline"
+    recipient_side: "map TY actor_id to same-version Dyadic side IDs; unresolved mapping stays unresolved and is never inferred from supporter identity"
+    supporter_count: "count distinct ext_id; if any supported row lacks ext_id, the relevant count is missing rather than a partial count"
+  battle_deaths_sensitivity:
+    source_unit: "dyadic-year only"
+    expected_version: "18.1"
+    missing_record_or_count: "keep missing; never infer zero"
+  country_controls:
+    action: "preserve missing values in master panel; no zero fill, no forward/backward fill, no linear interpolation in primary analysis"
+    model_stage: "any imputation must be fitted inside the training fold and compared with complete-case estimates; include missingness indicators as a sensitivity option"
+  identifiers:
+    action: "no fuzzy country-name matching; unresolved IDs go to a manual crosswalk queue and are never silently merged"
+  inactive_dyad_years:
+    action: "do not infer inactivity or zero deaths from a missing row in the active-dyad dataset; main sample requires observed dyad rows at t-1 and t"
+
+support_type_variables:
+  - ext_x  # troop support
+  - ext_p  # troop presence below the troop-support threshold; retain as separate auxiliary category
+  - ext_y  # access to infrastructure / joint operations
+  - ext_w  # weapons
+  - ext_m  # materiel / logistics
+  - ext_t  # training / expertise
+  - ext_f  # funding
+  - ext_i  # intelligence
+  - ext_l  # access to territory
+  - ext_o  # other support
+  - ext_u  # unknown support type
+# Unknown type (ext_u) remains a predictor but is excluded from the count of known support types.
+support_type_count_variables: [ext_x, ext_p, ext_y, ext_w, ext_m, ext_t, ext_f, ext_i, ext_l, ext_o]
+
+# Data must be downloaded manually from their official repositories and placed at the paths above.
+# These optional files are already expected in tidy country-year format (see README and templates).
+optional_controls:
+  use_nmc: true
+  use_wdi: true
+  use_vdem: true
+  nmc_variable: "cinc"
+  wdi_variables: ["population", "gdp_per_capita"]
+  vdem_variable: "v2x_polyarchy"
