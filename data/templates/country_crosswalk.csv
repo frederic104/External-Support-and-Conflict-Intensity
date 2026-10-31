@@ -1,1 +1,6 @@
 gwno,cow_ccode,iso3,vdem_country_text_id,valid_from,valid_to,ucdp_country_name,notes
+645,645,IRQ,IRQ,1975,2017,Iraq,COW NMC and WDI/V-Dem identifiers verified
+652,652,SYR,SYR,1975,2017,Syria,COW NMC and WDI/V-Dem identifiers verified
+660,660,LBN,LBN,1975,2017,Lebanon,COW NMC and WDI/V-Dem identifiers verified
+666,666,ISR,ISR,1975,2017,Israel,COW NMC and WDI/V-Dem identifiers verified
+678,678,,,1975,2017,Yemen (North Yemen),COW/YAR available; no direct WDI or V-Dem North Yemen identifier
