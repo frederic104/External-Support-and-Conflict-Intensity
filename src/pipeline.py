@@ -538,40 +538,60 @@ def build_esd_features(esd_ty: pd.DataFrame, esd_dy: pd.DataFrame, dy_all: pd.Da
     for part in summary_parts[1:]:
         features = features.merge(part, on=["dyad_id", "year"], how="left", validate="one_to_one")
 
-    # Join official DY coverage flag to TY detail; disagreements are audit failures, not silently reconciled.
-    comparison = dy_support.merge(features[["dyad_id", "year", "any_support_ty"]], on=["dyad_id", "year"], how="left", validate="one_to_one")
+    # Compare DY coverage with TY at the confirmed and all-recorded levels.
+    # Alleged-only TY rows are expected under the sensitivity definition.
+    comparison = dy_support.merge(
+        features[["dyad_id", "year", "any_support_ty", "any_support_confirmed", "any_support_alleged"]],
+        on=["dyad_id", "year"], how="left", validate="one_to_one")
     comparison["any_support_ty_for_check"] = pd.to_numeric(comparison["any_support_ty"], errors="coerce").fillna(0).astype(int)
+    comparison["any_support_confirmed_for_check"] = (
+        pd.to_numeric(comparison["any_support_confirmed"], errors="coerce").fillna(0).astype(int)
+    )
     comparison["mismatch"] = comparison["any_support_all"] != comparison["any_support_ty_for_check"]
+    comparison["alleged_only_mismatch"] = (
+        comparison["any_support_all"].eq(0)
+        & comparison["any_support_ty_for_check"].eq(1)
+        & comparison["any_support_confirmed_for_check"].eq(0)
+    )
+    comparison["mismatch_reason"] = np.select(
+        [comparison["alleged_only_mismatch"],
+         comparison["any_support_all"].eq(0) & comparison["any_support_confirmed_for_check"].eq(1)],
+        ["alleged_only_ty_support", "confirmed_ty_support_without_dy_support"],
+        default="dy_ty_recorded_support_difference",
+    )
     # Only active years will be analyzed, but retain the full mismatch report for inspection.
     comparison.loc[comparison["mismatch"]].to_csv(audit_dir / "esd_dy_ty_support_mismatch.csv", index=False)
-    mismatches = comparison[comparison["mismatch"]]
+    mismatches = comparison[comparison["mismatch"] & ~comparison["alleged_only_mismatch"]]
     if not mismatches.empty:
         raise ValueError(f"ESD DY/TY support-presence mismatch in {len(mismatches)} dyad-years; see esd_dy_ty_support_mismatch.csv")
 
     # Reindex with ESD DY as the complete dyad-year universe, then apply documented zero rules.
     features = dy_support.merge(features, on=["dyad_id", "year"], how="left", validate="one_to_one")
+    features["any_support_recorded"] = pd.to_numeric(features["any_support_ty"], errors="coerce")
     no_support = features["any_support_all"].eq(0)
     has_support = features["any_support_all"].eq(1)
+    no_recorded_support = no_support & features["any_support_recorded"].ne(1)
     for c in [f"{v}_{mode}" for v in type_variables for mode in ["confirmed", "all"]]:
         features[c] = pd.to_numeric(features[c], errors="coerce").astype(float)
-    # If ESD DY explicitly says no support, blank ESD detail fields are structural blanks and may become zero.
-    features["any_support_confirmed"] = features["any_support_confirmed"].where(~no_support, 0)
-    features["any_support_alleged"] = features["any_support_alleged"].where(~no_support, 0)
+    # Only DY=0 with no TY support is an explicit no-support record. Preserve
+    # alleged-only TY rows for the sensitivity dataset.
+    features["any_support_confirmed"] = features["any_support_confirmed"].where(~no_recorded_support, 0)
+    features["any_support_alleged"] = features["any_support_alleged"].where(~no_recorded_support, 0)
     # Preserve unknown side allocation as NA when support exists but TY detail/actor mapping is unresolved.
     for col in ["support_side_a_all", "support_side_b_all", "support_side_a_confirmed", "support_side_b_confirmed"]:
         features[col] = pd.to_numeric(features[col], errors="coerce").astype(float)
-        features.loc[no_support, col] = 0.0
+        features.loc[no_recorded_support, col] = 0.0
     no_detail = has_support & features["ty_detail_rows"].isna()
     features.loc[no_detail, ["support_side_a_all", "support_side_b_all"]] = np.nan
     features.loc[features["support_side_unmapped_all"].astype("boolean").fillna(False).astype(bool), ["support_side_a_all", "support_side_b_all"]] = np.nan
     features.loc[features["support_side_unmapped_confirmed"].astype("boolean").fillna(False).astype(bool), ["support_side_a_confirmed", "support_side_b_confirmed"]] = np.nan
     for v in type_variables:
-        features[f"{v}_confirmed"] = features[f"{v}_confirmed"].where(~no_support, 0)
-        features[f"{v}_all"] = features[f"{v}_all"].where(~no_support, 0)
+        features[f"{v}_confirmed"] = features[f"{v}_confirmed"].where(~no_recorded_support, 0)
+        features[f"{v}_all"] = features[f"{v}_all"].where(~no_recorded_support, 0)
     count_cols = ["n_supporters_confirmed_raw", "n_supporters_confirmed_coalition_collapsed",
                   "n_supporters_all_raw", "n_supporters_all_coalition_collapsed"]
     for col in count_cols:
-        features[col] = features[col].where(~no_support, 0)
+        features[col] = features[col].where(~no_recorded_support, 0)
     # If any supported TY row lacks a supporter ID, the supporter count is underidentified.
     # Do not retain a partial count as if it were complete.
     def _as_bool_false_on_missing(value: Any) -> bool:
@@ -589,7 +609,7 @@ def build_esd_features(esd_ty: pd.DataFrame, esd_dy: pd.DataFrame, dy_all: pd.Da
     for v in type_variables:
         features.loc[no_detail, [f"{v}_confirmed", f"{v}_all"]] = np.nan
     features.loc[no_detail, count_cols] = np.nan
-    features["support_configuration_all"] = features.apply(_configuration, axis=1, args=("support_side_a_all", "support_side_b_all", "support_side_unmapped_all", "any_support_all"))
+    features["support_configuration_all"] = features.apply(_configuration, axis=1, args=("support_side_a_all", "support_side_b_all", "support_side_unmapped_all", "any_support_recorded"))
     features["support_configuration_confirmed"] = features.apply(_configuration, axis=1, args=("support_side_a_confirmed", "support_side_b_confirmed", "support_side_unmapped_confirmed", "any_support_confirmed"))
     for c in ["any_support_confirmed", "any_support_alleged"] + [f"{v}_{mode}" for v in type_variables for mode in ["confirmed", "all"]]:
         features[c] = pd.to_numeric(features[c], errors="coerce").astype(float)
@@ -966,7 +986,7 @@ def run(config_path: Path) -> None:
     model.to_csv(out_dir / "model_dataset.csv", index=False)
     if cfg["project"].get("alleged_support_sensitivity", True):
         sens = panel.copy()
-        sens["any_support_main"] = sens["any_support_all"]
+        sens["any_support_main"] = sens["any_support_recorded"]
         sens["support_configuration_main"] = sens["support_configuration_all"]
         for v in type_vars:
             sens[f"{v}_main"] = sens[f"{v}_all"]
@@ -984,7 +1004,7 @@ def run(config_path: Path) -> None:
         "war_share": float(panel["war_t"].mean()),
         "minor_to_war_transitions": int(panel["minor_to_war"].sum()),
         "any_confirmed_support_rows": int(panel["any_support_confirmed"].fillna(0).sum()),
-        "any_recorded_support_rows": int(panel["any_support_all"].fillna(0).sum()),
+        "any_recorded_support_rows": int(panel["any_support_recorded"].fillna(0).sum()),
         "side_mapping_unresolved_rows_all_support": int(panel["side_mapping_unresolved_all"].fillna(0).sum()),
         "side_mapping_unresolved_rows_confirmed_support": int(panel["side_mapping_unresolved_confirmed"].fillna(0).sum()),
         "battle_deaths_sensitivity": brd_status,
