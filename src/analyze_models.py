@@ -14,6 +14,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import accuracy_score, average_precision_score, brier_score_loss, roc_auc_score
+from sklearn.model_selection import StratifiedGroupKFold
 from xgboost import XGBClassifier
 import shap
 
@@ -44,6 +45,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", default="reports/model_analysis")
     parser.add_argument("--test-start-year", type=int, default=2009)
     parser.add_argument("--random-state", type=int, default=42)
+    parser.add_argument("--cv-splits", type=int, default=5)
     return parser.parse_args()
 
 
@@ -120,9 +122,9 @@ def save_plots(output_dir: Path, coefficients: pd.DataFrame,
         fig.savefig(output_dir / "logistic_odds_ratios.png", bbox_inches="tight")
         plt.close(fig)
 
-    predictive = metrics[metrics["method"].eq("predictive_cv")].copy()
+    predictive = metrics[metrics["method"].eq("predictive_group_cv")].copy()
     if predictive.empty:
-        predictive = metrics[metrics["method"].eq("predictive")].copy()
+        predictive = metrics[metrics["method"].eq("predictive_temporal_cv")].copy()
     if not predictive.empty:
         plot_cols = [c for c in ["roc_auc_mean", "average_precision_mean", "brier_mean"]
                      if c in predictive]
@@ -333,7 +335,8 @@ def fit_support_hypotheses(df: pd.DataFrame, output_dir: Path) -> None:
 
 
 def fit_predictive_models(
-    df: pd.DataFrame, output_dir: Path, test_start_year: int, random_state: int
+    df: pd.DataFrame, output_dir: Path, test_start_year: int,
+    random_state: int, cv_splits: int,
 ) -> tuple[list[dict[str, Any]], np.ndarray | None, pd.DataFrame | None]:
     features = MODEL_FEATURES["M4"]
     sample = complete_case(df, features)
@@ -396,11 +399,84 @@ def fit_predictive_models(
             }).sort_values("mean_abs_shap", ascending=False)
             shap_importance.to_csv(output_dir / "xgboost_shap_importance.csv", index=False)
     pd.DataFrame(importance_rows).to_csv(output_dir / "tree_feature_importance.csv", index=False)
-    cv_summary = temporal_cross_validation(
-        sample, features, output_dir, random_state, test_start_year
+    cv_summary = grouped_cross_validation(
+        sample, features, output_dir, random_state, n_splits=cv_splits
     )
+    cv_summary.extend(temporal_cross_validation(
+        sample, features, output_dir, random_state, test_start_year
+    ))
     metrics.extend(cv_summary)
     return metrics, shap_values_out, shap_features_out
+
+
+def _predictive_estimator(model_name: str, seed: int) -> Any:
+    if model_name == "random_forest":
+        return RandomForestClassifier(
+            n_estimators=400, min_samples_leaf=2, class_weight="balanced",
+            random_state=seed, n_jobs=-1,
+        )
+    return XGBClassifier(
+        n_estimators=250, max_depth=2, learning_rate=0.05,
+        subsample=0.8, colsample_bytree=0.8, min_child_weight=2,
+        objective="binary:logistic", eval_metric="logloss",
+        random_state=seed, n_jobs=1,
+    )
+
+
+def grouped_cross_validation(
+    sample: pd.DataFrame, features: list[str], output_dir: Path,
+    random_state: int, n_splits: int,
+) -> list[dict[str, Any]]:
+    """Evaluate models on dyad-held-out, class-stratified folds."""
+    if n_splits < 2 or sample["dyad_id"].nunique() < n_splits:
+        raise ValueError("Grouped CV requires at least as many dyads as folds.")
+    splitter = StratifiedGroupKFold(
+        n_splits=n_splits, shuffle=True, random_state=random_state
+    )
+    rows: list[dict[str, Any]] = []
+    X, y, groups = sample[features], sample["war_t"].astype(int), sample["dyad_id"]
+    for fold_id, (train_idx, test_idx) in enumerate(
+        splitter.split(X, y, groups=groups), start=1
+    ):
+        train, test = sample.iloc[train_idx], sample.iloc[test_idx]
+        for model_name in ("random_forest", "xgboost"):
+            for repetition, seed in enumerate(
+                [random_state, random_state + 101, random_state + 202], start=1
+            ):
+                estimator = _predictive_estimator(model_name, seed)
+                estimator.fit(train[features], train["war_t"].astype(int))
+                probability = estimator.predict_proba(test[features])[:, 1]
+                result = binary_metrics(test["war_t"].astype(int), probability)
+                rows.append({
+                    "fold": fold_id,
+                    "model": model_name,
+                    "repetition": repetition,
+                    "train_n": len(train),
+                    "test_n": len(test),
+                    "train_dyads": train["dyad_id"].nunique(),
+                    "test_dyads": test["dyad_id"].nunique(),
+                    **{key: value for key, value in result.items() if key != "n"},
+                })
+    fold_frame = pd.DataFrame(rows)
+    fold_frame.to_csv(output_dir / "grouped_cv_metrics.csv", index=False)
+    summary = fold_frame.groupby("model").agg(
+        folds=("fold", "nunique"),
+        repetitions=("repetition", "count"),
+        train_n_mean=("train_n", "mean"),
+        test_n_mean=("test_n", "mean"),
+        test_dyads_mean=("test_dyads", "mean"),
+        roc_auc_mean=("roc_auc", "mean"),
+        roc_auc_sd=("roc_auc", "std"),
+        average_precision_mean=("average_precision", "mean"),
+        average_precision_sd=("average_precision", "std"),
+        brier_mean=("brier", "mean"),
+        brier_sd=("brier", "std"),
+        accuracy_mean=("accuracy", "mean"),
+        accuracy_sd=("accuracy", "std"),
+    ).reset_index()
+    summary.insert(1, "method", "predictive_group_cv")
+    summary["status"] = "ok"
+    return summary.to_dict("records")
 
 
 def temporal_cross_validation(
@@ -470,7 +546,7 @@ def temporal_cross_validation(
         accuracy_mean=("accuracy", "mean"),
         accuracy_sd=("accuracy", "std"),
     ).reset_index()
-    summary.insert(1, "method", "predictive_cv")
+    summary.insert(1, "method", "predictive_temporal_cv")
     summary["status"] = "ok"
     return summary.to_dict("records")
 
@@ -483,7 +559,7 @@ def main() -> None:
     logistic_metrics = fit_logistic(df, output_dir)
     fit_support_hypotheses(df, output_dir)
     predictive_metrics, shap_values, shap_features = fit_predictive_models(
-        df, output_dir, args.test_start_year, args.random_state)
+        df, output_dir, args.test_start_year, args.random_state, args.cv_splits)
     metrics = pd.DataFrame(logistic_metrics + predictive_metrics)
     metrics.to_csv(output_dir / "model_metrics.csv", index=False)
     coefficients = pd.read_csv(output_dir / "logistic_coefficients.csv")
@@ -493,13 +569,15 @@ def main() -> None:
         "rows": int(len(df)),
         "test_start_year": args.test_start_year,
         "random_state": args.random_state,
+        "cv_splits": args.cv_splits,
         "logistic_models": list(MODEL_FEATURES),
         "support_hypotheses": ["H2_support_type", "H3_support_configuration",
                                "minor_to_war_escalation"],
         "predictive_features": MODEL_FEATURES["M4"],
         "note": "Logistic models use cluster-robust standard errors by dyad. "
-                "Tree models use complete-case data, a fixed time-ordered split, and "
-                "repeated expanding-window temporal validation; repeated seeds assess "
+                "Tree models use complete-case data, dyad-held-out stratified grouped "
+                "cross-validation, and repeated expanding-window temporal validation; "
+                "repeated seeds assess "
                 "algorithmic sensitivity, not additional independent observations. "
                 "SHAP values describe prediction, not causal effects.",
     }, indent=2), encoding="utf-8")
