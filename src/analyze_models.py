@@ -9,6 +9,9 @@ from typing import Any
 import numpy as np
 import pandas as pd
 import statsmodels.api as sm
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import accuracy_score, brier_score_loss, roc_auc_score
 from xgboost import XGBClassifier
@@ -54,11 +57,99 @@ def complete_case(df: pd.DataFrame, features: list[str]) -> pd.DataFrame:
     missing = sorted(set(features) - set(df.columns))
     if missing:
         raise ValueError(f"Model dataset is missing model columns: {missing}")
-    out = df[["war_t", "year", "dyad_id", *features]].copy()
+    columns = list(dict.fromkeys(["war_t", "year", "dyad_id", *features]))
+    out = df[columns].copy()
     out = out.replace([np.inf, -np.inf], np.nan).dropna()
     if out["war_t"].nunique() < 2:
         raise ValueError("A model sample must contain both war_t classes.")
     return out
+
+
+def save_plots(output_dir: Path, coefficients: pd.DataFrame,
+               metrics: pd.DataFrame, importance: pd.DataFrame,
+               shap_importance: pd.DataFrame | None = None) -> None:
+    """Write publication-style vector and raster figures from saved summaries."""
+    plt.rcParams.update({
+        "font.family": "DejaVu Sans",
+        "axes.spines.top": False,
+        "axes.spines.right": False,
+        "figure.dpi": 140,
+        "savefig.dpi": 300,
+    })
+
+    logit = coefficients[coefficients["term"].ne("const")].copy()
+    if not logit.empty:
+        logit["label"] = logit["term"].str.replace("_", " ", regex=False)
+        logit["lo"] = np.exp(logit["estimate"] - 1.96 * logit["std_error"])
+        logit["hi"] = np.exp(logit["estimate"] + 1.96 * logit["std_error"])
+        models = list(dict.fromkeys(logit["model"]))
+        fig, axes = plt.subplots(1, len(models), figsize=(4.5 * len(models), 5),
+                                 sharey=True, squeeze=False)
+        for ax, model in zip(axes[0], models):
+            part = logit[logit["model"].eq(model)].sort_values("odds_ratio")
+            y = np.arange(len(part))
+            ax.errorbar(part["odds_ratio"], y,
+                        xerr=[part["odds_ratio"] - part["lo"],
+                              part["hi"] - part["odds_ratio"]],
+                        fmt="o", color="#1f4e79", ecolor="#6b7280", capsize=3)
+            ax.axvline(1, color="#9ca3af", linestyle="--", linewidth=1)
+            ax.set_xscale("log")
+            ax.set_title(model)
+            ax.set_xlabel("Odds ratio (95% CI)")
+            ax.set_yticks(y)
+            ax.set_yticklabels(part["label"])
+        fig.suptitle("Logistic regression estimates", y=1.02, fontsize=14)
+        fig.tight_layout()
+        fig.savefig(output_dir / "logistic_odds_ratios.pdf", bbox_inches="tight")
+        fig.savefig(output_dir / "logistic_odds_ratios.png", bbox_inches="tight")
+        plt.close(fig)
+
+    predictive = metrics[metrics["method"].eq("predictive")].copy()
+    if not predictive.empty:
+        plot_cols = [c for c in ["test_roc_auc", "test_accuracy", "test_brier"] if c in predictive]
+        long = predictive.melt(id_vars="model", value_vars=plot_cols,
+                               var_name="metric", value_name="value").dropna()
+        if not long.empty:
+            fig, ax = plt.subplots(figsize=(7, 4.5))
+            for metric, part in long.groupby("metric", sort=False):
+                ax.plot(part["model"], part["value"], marker="o", label=metric.removeprefix("test_"))
+            ax.set_ylim(0, 1)
+            ax.set_ylabel("Score")
+            ax.set_title("Time-ordered test performance")
+            ax.legend(frameon=False)
+            fig.tight_layout()
+            fig.savefig(output_dir / "predictive_performance.pdf", bbox_inches="tight")
+            fig.savefig(output_dir / "predictive_performance.png", bbox_inches="tight")
+            plt.close(fig)
+
+    if not importance.empty:
+        part = importance.copy()
+        part["label"] = part["feature"].str.replace("_", " ", regex=False)
+        fig, axes = plt.subplots(1, part["model"].nunique(),
+                                 figsize=(6 * part["model"].nunique(), 5),
+                                 squeeze=False)
+        for ax, (model, group) in zip(axes[0], part.groupby("model", sort=False)):
+            group = group.sort_values("importance")
+            ax.barh(group["label"], group["importance"], color="#2a9d8f")
+            ax.set_title(model.replace("_", " ").title())
+            ax.set_xlabel("Feature importance")
+        fig.suptitle("Tree-model feature importance", y=1.02, fontsize=14)
+        fig.tight_layout()
+        fig.savefig(output_dir / "tree_feature_importance.pdf", bbox_inches="tight")
+        fig.savefig(output_dir / "tree_feature_importance.png", bbox_inches="tight")
+        plt.close(fig)
+
+    if shap_importance is not None and not shap_importance.empty:
+        part = shap_importance.sort_values("mean_abs_shap")
+        fig, ax = plt.subplots(figsize=(7, 5))
+        ax.barh(part["feature"].str.replace("_", " ", regex=False),
+                part["mean_abs_shap"], color="#e76f51")
+        ax.set_xlabel("Mean absolute SHAP value")
+        ax.set_title("XGBoost feature contribution")
+        fig.tight_layout()
+        fig.savefig(output_dir / "xgboost_shap_importance.pdf", bbox_inches="tight")
+        fig.savefig(output_dir / "xgboost_shap_importance.png", bbox_inches="tight")
+        plt.close(fig)
 
 
 def binary_metrics(y: pd.Series, probability: np.ndarray) -> dict[str, float]:
@@ -112,7 +203,7 @@ def fit_logistic(df: pd.DataFrame, output_dir: Path) -> list[dict[str, Any]]:
 
 def fit_predictive_models(
     df: pd.DataFrame, output_dir: Path, test_start_year: int, random_state: int
-) -> list[dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], pd.DataFrame | None]:
     features = MODEL_FEATURES["M4"]
     sample = complete_case(df, features)
     train = sample[sample["year"] < test_start_year].copy()
@@ -138,6 +229,7 @@ def fit_predictive_models(
     }
     metrics: list[dict[str, Any]] = []
     importance_rows: list[dict[str, Any]] = []
+    shap_importance = None
     for name, estimator in models.items():
         estimator.fit(X_train, y_train)
         probability = estimator.predict_proba(X_test)[:, 1]
@@ -163,13 +255,13 @@ def fit_predictive_models(
             shap_frame.insert(0, "dyad_id", test["dyad_id"].to_numpy())
             shap_frame.insert(1, "year", test["year"].to_numpy())
             shap_frame.to_csv(output_dir / "xgboost_shap_values.csv", index=False)
-            pd.DataFrame({
+            shap_importance = pd.DataFrame({
                 "feature": features,
                 "mean_abs_shap": np.abs(shap_values).mean(axis=0),
-            }).sort_values("mean_abs_shap", ascending=False).to_csv(
-                output_dir / "xgboost_shap_importance.csv", index=False)
+            }).sort_values("mean_abs_shap", ascending=False)
+            shap_importance.to_csv(output_dir / "xgboost_shap_importance.csv", index=False)
     pd.DataFrame(importance_rows).to_csv(output_dir / "tree_feature_importance.csv", index=False)
-    return metrics
+    return metrics, shap_importance
 
 
 def main() -> None:
@@ -178,10 +270,13 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     df = load_panel(ROOT / args.dataset)
     logistic_metrics = fit_logistic(df, output_dir)
-    predictive_metrics = fit_predictive_models(
+    predictive_metrics, shap_importance = fit_predictive_models(
         df, output_dir, args.test_start_year, args.random_state)
     metrics = pd.DataFrame(logistic_metrics + predictive_metrics)
     metrics.to_csv(output_dir / "model_metrics.csv", index=False)
+    coefficients = pd.read_csv(output_dir / "logistic_coefficients.csv")
+    importance = pd.read_csv(output_dir / "tree_feature_importance.csv")
+    save_plots(output_dir, coefficients, metrics, importance, shap_importance)
     (output_dir / "run_summary.json").write_text(json.dumps({
         "dataset": str(ROOT / args.dataset),
         "rows": int(len(df)),
