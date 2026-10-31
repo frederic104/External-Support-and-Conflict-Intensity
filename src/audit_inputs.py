@@ -33,6 +33,7 @@ def main() -> None:
         "vdem": ["vdemcountrytextid", "year"],
     }
     for key in ["dyadic", "esd_ty", "esd_dy", "brd_dyadic", "nmc", "wdi", "vdem", "country_crosswalk"]:
+        configured_path = cfg["files"].get(key)
         path = ROOT / configured_path if configured_path else None
         if path is None:
             records.append({"source": key,"path": None,"status": "not_configured","rows": None,
