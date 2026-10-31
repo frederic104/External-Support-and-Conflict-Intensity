@@ -149,7 +149,7 @@ After a successful pipeline run, execute:
 python src/analyze_models.py
 ```
 
-The script fits M0–M4 Logistic Regression models with dyad-clustered standard errors, then fits Random Forest and XGBoost models using the M4 feature set and a time-ordered test split beginning in 2009. It writes coefficients, odds ratios, model metrics, tree feature importance, XGBoost SHAP values, and a run summary to `reports/model_analysis/`. The default model dataset uses confirmed support; run the same command with `--dataset data/processed/model_dataset_all_recorded_support_sensitivity.csv` for the alleged-support sensitivity analysis.
+The script fits M0–M4 Logistic Regression models with dyad-clustered standard errors, then fits Random Forest and XGBoost models using the M4 feature set and a time-ordered test split beginning in 2009. M1 replaces the near-constant support indicator with `log1p(n_supporters_confirmed_raw)`, the logged number of distinct confirmed supporters; M2–M4 retain the existing CINC, population, GDP per capita, and V-Dem blocks. It writes coefficients, odds ratios, model metrics, tree feature importance, XGBoost SHAP values, and a run summary to `reports/model_analysis/`. The default model dataset uses confirmed support; run the same command with `--dataset data/processed/model_dataset_all_recorded_support_sensitivity.csv` for the alleged-support sensitivity analysis.
 
 The tree models are predictive supplements, not causal estimators. Missing rows are excluded per model's complete-case sample; no outcome or control value is imputed by this script.
 
