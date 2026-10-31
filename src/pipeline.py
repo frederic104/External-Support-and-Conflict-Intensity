@@ -163,6 +163,8 @@ def canonical_country(value: Any, aliases: dict[str, str]) -> str | None:
     s = re.sub(r"\s+", " ", str(value).strip()).lower()
     if not s or s in {"-99", "-999", "-9999", "nan", "none"}:
         return None
+    if s.startswith("government of "):
+        s = s.removeprefix("government of ").strip()
     return aliases.get(s, s)
 
 
