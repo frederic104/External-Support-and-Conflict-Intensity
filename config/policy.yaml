@@ -19,6 +19,8 @@ project:
     "republic of iraq": "iraq"
     "republic of yemen": "yemen"
     "yemen, republic of": "yemen"
+    "yemen (north yemen)": "yemen"
+    "yemen (south yemen)": "yemen"
     "state of palestine": "palestine"
     "west bank and gaza": "palestine"
     "occupied palestinian territory": "palestine"
