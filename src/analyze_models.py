@@ -120,23 +120,26 @@ def save_plots(output_dir: Path, coefficients: pd.DataFrame,
         fig.savefig(output_dir / "logistic_odds_ratios.png", bbox_inches="tight")
         plt.close(fig)
 
-    predictive = metrics[metrics["method"].eq("predictive")].copy()
+    predictive = metrics[metrics["method"].eq("predictive_cv")].copy()
+    if predictive.empty:
+        predictive = metrics[metrics["method"].eq("predictive")].copy()
     if not predictive.empty:
-        fig, axes = plt.subplots(1, 2, figsize=(10, 4.5), sharey=True)
-        for ax, metric, label, higher_is_better in [
-            (axes[0], "test_roc_auc", "ROC-AUC (higher is better)", True),
-            (axes[1], "test_brier", "Brier score (lower is better)", False),
-        ]:
-            part = predictive[["model", metric]].dropna().sort_values(metric)
-            ax.barh(part["model"].str.replace("_", " ").str.title(), part[metric],
-                    color="#2a6f97")
-            for y, value in enumerate(part[metric]):
-                ax.text(value + (0.01 if higher_is_better else 0.002), y,
-                        f"{value:.3f}", va="center", fontsize=9)
-            ax.set_title(label)
-            ax.set_xlim(0, min(1, max(part[metric].max() * 1.18, 0.1)))
-            ax.grid(axis="x", alpha=0.25)
-        fig.suptitle("Out-of-time predictive performance (test years)", y=1.02, fontsize=14)
+        plot_cols = [c for c in ["roc_auc_mean", "average_precision_mean", "brier_mean"]
+                     if c in predictive]
+        if not plot_cols:
+            plot_cols = ["test_roc_auc", "test_accuracy", "test_brier"]
+        long = predictive.melt(id_vars="model", value_vars=plot_cols,
+                               var_name="metric", value_name="value").dropna()
+        fig, ax = plt.subplots(figsize=(7, 4.5))
+        for metric, part in long.groupby("metric", sort=False):
+            label = metric.replace("_mean", "").replace("test_", "").replace("_", " ")
+            ax.plot(part["model"].str.replace("_", " ").str.title(), part["value"],
+                    marker="o", linewidth=2, label=label)
+        ax.set_ylim(0, 1)
+        ax.set_ylabel("Score")
+        ax.set_title("Predictive performance across temporal validation folds")
+        ax.legend(frameon=False)
+        ax.grid(axis="y", alpha=0.2)
         fig.tight_layout()
         fig.savefig(output_dir / "predictive_performance.pdf", bbox_inches="tight")
         fig.savefig(output_dir / "predictive_performance.png", bbox_inches="tight")
@@ -213,16 +216,21 @@ def fit_logistic(df: pd.DataFrame, output_dir: Path) -> list[dict[str, Any]]:
                 maxiter=200,
                 cov_type="cluster",
                 cov_kwds={"groups": sample["dyad_id"]},
+                warn_convergence=False,
             )
         except (ValueError, np.linalg.LinAlgError) as exc:
             metrics.append({"model": model_name, "method": "logistic", "status": "failed",
                             "n": len(sample), "error": str(exc)})
             continue
+        converged = bool(fit.mle_retvals.get("converged", True))
         probability = fit.predict(X)
-        metrics.append({"model": model_name, "method": "logistic", "status": "ok",
+        metrics.append({"model": model_name, "method": "logistic",
+                        "status": "ok" if converged else "nonconverged",
                         **binary_metrics(y, probability),
                         "pseudo_r2": float(fit.prsquared),
-                        "aic": float(fit.aic)})
+                        "aic": float(fit.aic),
+                        "converged": converged,
+                        "warning": "" if converged else "maximum_likelihood_not_converged"})
         for term, estimate, stderr, pvalue in zip(
                 fit.params.index, fit.params, fit.bse, fit.pvalues):
             coefficients.append({
@@ -254,10 +262,12 @@ def _fit_binary_specification(
         fit = sm.Logit(y, X).fit(
             disp=False, maxiter=200, cov_type="cluster",
             cov_kwds={"groups": sample["dyad_id"]},
+            warn_convergence=False,
         )
     except (ValueError, np.linalg.LinAlgError, FloatingPointError) as exc:
         return [], {"model": model_name, "hypothesis": hypothesis, "status": "failed",
                     "n": len(sample), "error": str(exc)}
+    converged = bool(fit.mle_retvals.get("converged", True))
     rows = [{
         "model": model_name,
         "hypothesis": hypothesis,
@@ -267,12 +277,16 @@ def _fit_binary_specification(
         "std_error": float(stderr),
         "p_value": float(pvalue),
         "n": len(sample),
+        "converged": converged,
     } for term, estimate, stderr, pvalue in zip(
         fit.params.index, fit.params, fit.bse, fit.pvalues
     )]
     return rows, {
-        "model": model_name, "hypothesis": hypothesis, "status": "ok",
+        "model": model_name, "hypothesis": hypothesis,
+        "status": "ok" if converged else "nonconverged",
         "n": len(sample), "pseudo_r2": float(fit.prsquared), "aic": float(fit.aic),
+        "converged": converged,
+        "warning": "" if converged else "maximum_likelihood_not_converged",
     }
 
 
@@ -382,7 +396,83 @@ def fit_predictive_models(
             }).sort_values("mean_abs_shap", ascending=False)
             shap_importance.to_csv(output_dir / "xgboost_shap_importance.csv", index=False)
     pd.DataFrame(importance_rows).to_csv(output_dir / "tree_feature_importance.csv", index=False)
+    cv_summary = temporal_cross_validation(
+        sample, features, output_dir, random_state, test_start_year
+    )
+    metrics.extend(cv_summary)
     return metrics, shap_values_out, shap_features_out
+
+
+def temporal_cross_validation(
+    sample: pd.DataFrame, features: list[str], output_dir: Path,
+    random_state: int, first_test_year: int,
+) -> list[dict[str, Any]]:
+    """Evaluate tree models on repeated, forward-looking time folds.
+
+    Each fold trains only on earlier years and tests on the following two years.
+    Three estimator seeds provide a small sensitivity check without fabricating
+    observations or treating repeated draws as independent data.
+    """
+    years = sorted(int(year) for year in sample["year"].dropna().unique())
+    candidate_starts = [year for year in years if year >= first_test_year]
+    starts = candidate_starts[::2][:4]
+    folds: list[dict[str, Any]] = []
+    for fold_id, start in enumerate(starts, start=1):
+        train = sample[sample["year"] < start]
+        test = sample[(sample["year"] >= start) & (sample["year"] < start + 2)]
+        if (len(train) < 30 or len(test) < 4 or train["war_t"].nunique() < 2
+                or test["war_t"].nunique() < 2):
+            continue
+        for model_name in ("random_forest", "xgboost"):
+            for repetition, seed in enumerate(
+                [random_state, random_state + 101, random_state + 202], start=1
+            ):
+                if model_name == "random_forest":
+                    estimator = RandomForestClassifier(
+                        n_estimators=400, min_samples_leaf=2, class_weight="balanced",
+                        random_state=seed, n_jobs=-1,
+                    )
+                else:
+                    estimator = XGBClassifier(
+                        n_estimators=250, max_depth=2, learning_rate=0.05,
+                        subsample=0.8, colsample_bytree=0.8, min_child_weight=2,
+                        objective="binary:logistic", eval_metric="logloss",
+                        random_state=seed, n_jobs=1,
+                    )
+                estimator.fit(train[features], train["war_t"].astype(int))
+                probability = estimator.predict_proba(test[features])[:, 1]
+                result = binary_metrics(test["war_t"].astype(int), probability)
+                folds.append({
+                    "fold": fold_id,
+                    "model": model_name,
+                    "repetition": repetition,
+                    "test_year_min": int(test["year"].min()),
+                    "test_year_max": int(test["year"].max()),
+                    **{key: value for key, value in result.items() if key != "n"},
+                    "train_n": len(train),
+                    "test_n": len(test),
+                })
+    fold_frame = pd.DataFrame(folds)
+    fold_frame.to_csv(output_dir / "temporal_cv_metrics.csv", index=False)
+    if fold_frame.empty:
+        return []
+    summary = fold_frame.groupby("model").agg(
+        folds=("fold", "nunique"),
+        repetitions=("repetition", "count"),
+        train_n_mean=("train_n", "mean"),
+        test_n_mean=("test_n", "mean"),
+        roc_auc_mean=("roc_auc", "mean"),
+        roc_auc_sd=("roc_auc", "std"),
+        average_precision_mean=("average_precision", "mean"),
+        average_precision_sd=("average_precision", "std"),
+        brier_mean=("brier", "mean"),
+        brier_sd=("brier", "std"),
+        accuracy_mean=("accuracy", "mean"),
+        accuracy_sd=("accuracy", "std"),
+    ).reset_index()
+    summary.insert(1, "method", "predictive_cv")
+    summary["status"] = "ok"
+    return summary.to_dict("records")
 
 
 def main() -> None:
@@ -408,7 +498,9 @@ def main() -> None:
                                "minor_to_war_escalation"],
         "predictive_features": MODEL_FEATURES["M4"],
         "note": "Logistic models use cluster-robust standard errors by dyad. "
-                "Tree models use complete-case data and a fixed time-ordered split; "
+                "Tree models use complete-case data, a fixed time-ordered split, and "
+                "repeated expanding-window temporal validation; repeated seeds assess "
+                "algorithmic sensitivity, not additional independent observations. "
                 "SHAP values describe prediction, not causal effects.",
     }, indent=2), encoding="utf-8")
     print(metrics.to_string(index=False))
