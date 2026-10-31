@@ -22,13 +22,13 @@ ROOT = Path(__file__).resolve().parents[1]
 MODEL_FEATURES: dict[str, list[str]] = {
     "M0": ["lag_intensity", "lag_conflict_type", "lag_episode_age_years", "year"],
     "M1": ["lag_intensity", "lag_conflict_type", "lag_episode_age_years", "year",
-           "any_support_main"],
+           "log_supporters_confirmed"],
     "M2": ["lag_intensity", "lag_conflict_type", "lag_episode_age_years", "year",
-           "any_support_main", "cinc", "population"],
+           "log_supporters_confirmed", "cinc", "population"],
     "M3": ["lag_intensity", "lag_conflict_type", "lag_episode_age_years", "year",
-           "any_support_main", "cinc", "population", "gdp_per_capita"],
+           "log_supporters_confirmed", "cinc", "population", "gdp_per_capita"],
     "M4": ["lag_intensity", "lag_conflict_type", "lag_episode_age_years", "year",
-           "any_support_main", "cinc", "population", "gdp_per_capita",
+           "log_supporters_confirmed", "cinc", "population", "gdp_per_capita",
            "v2x_polyarchy"],
 }
 
@@ -50,6 +50,12 @@ def load_panel(path: Path) -> pd.DataFrame:
     missing = sorted(required - set(df.columns))
     if missing:
         raise ValueError(f"Model dataset is missing required columns: {missing}")
+    if "n_supporters_confirmed_raw" not in df.columns:
+        raise ValueError(
+            "Model dataset is missing required support-count column: "
+            "n_supporters_confirmed_raw"
+        )
+    df["log_supporters_confirmed"] = np.log1p(df["n_supporters_confirmed_raw"])
     return df
 
 
