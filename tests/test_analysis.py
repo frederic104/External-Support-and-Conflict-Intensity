@@ -184,6 +184,38 @@ class TestAnalysisPolicy(unittest.TestCase):
             self.assertIn("war_n", metrics[0])
             self.assertIn("minor_n", metrics[0])
 
+    def test_adjusted_logistic_specs_share_common_sample_and_separate_controls(self):
+        df = make_analysis_sample(30)
+        df.loc[0, "population"] = np.nan
+        df.loc[1, "cinc"] = np.nan
+        df.loc[2, "gdp_per_capita"] = np.nan
+        df.loc[3, "v2x_polyarchy"] = np.nan
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp)
+            metrics = analyze_models.fit_logistic(df, output_dir)
+            metric_frame = pd.DataFrame(metrics)
+            adjusted = metric_frame[
+                metric_frame["sample_specification"].eq("adjusted_alternatives_common")
+            ]
+            self.assertEqual(
+                set(adjusted["model"]),
+                {"M0_adjusted", "M1_adjusted", "M2_CINC", "M3_GDP",
+                 "M4_VDEM", "M2_POP_ALT"},
+            )
+            self.assertEqual(adjusted["n"].nunique(), 1)
+            self.assertEqual(adjusted["war_n"].nunique(), 1)
+            self.assertTrue((adjusted["n"] == 26).all())
+            self.assertTrue("control_spearman_correlations.csv" in {
+                path.name for path in output_dir.iterdir()
+            })
+            vif = pd.read_csv(output_dir / "control_vif.csv")
+            self.assertEqual(set(vif["model"]), {
+                "M2_CINC", "M3_GDP", "M4_VDEM", "M2_POP_ALT"
+            })
+            self.assertNotIn("population", analyze_models.MODEL_FEATURES["M2_CINC"])
+            self.assertNotIn("cinc", analyze_models.MODEL_FEATURES["M2_POP_ALT"])
+            self.assertNotIn("v2x_polyarchy", analyze_models.MODEL_FEATURES["M3_GDP"])
+
     def test_h2_fdr_is_only_added_to_support_type_terms(self):
         df = make_analysis_sample(30)
         with tempfile.TemporaryDirectory() as tmp:
