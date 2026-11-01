@@ -15,6 +15,7 @@ import matplotlib.pyplot as plt
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import accuracy_score, average_precision_score, brier_score_loss, roc_auc_score
 from sklearn.model_selection import StratifiedGroupKFold
+from statsmodels.stats.multitest import multipletests
 from xgboost import XGBClassifier
 import shap
 
@@ -57,16 +58,10 @@ def load_panel(path: Path) -> pd.DataFrame:
     missing = sorted(required - set(df.columns))
     if missing:
         raise ValueError(f"Model dataset is missing required columns: {missing}")
-    if "n_supporters_confirmed_raw" not in df.columns:
-        raise ValueError(
-            "Model dataset is missing required support-count column: "
-            "n_supporters_confirmed_raw"
-        )
     required_support = {"n_support_types_confirmed", "support_configuration_confirmed"}
     missing_support = sorted(required_support - set(df.columns))
     if missing_support:
         raise ValueError(f"Model dataset is missing support-analysis columns: {missing_support}")
-    df["log_supporters_confirmed"] = np.log1p(df["n_supporters_confirmed_raw"])
     return df
 
 
@@ -74,7 +69,9 @@ def complete_case(df: pd.DataFrame, features: list[str]) -> pd.DataFrame:
     missing = sorted(set(features) - set(df.columns))
     if missing:
         raise ValueError(f"Model dataset is missing model columns: {missing}")
-    columns = list(dict.fromkeys(["war_t", "year", "dyad_id", *features]))
+    metadata = ["war_t", "year", "dyad_id", "conflict_id", "lag_conflict_id"]
+    columns = list(dict.fromkeys([*metadata, *features]))
+    columns = [column for column in columns if column in df.columns]
     out = df[columns].copy()
     out = out.replace([np.inf, -np.inf], np.nan).dropna()
     if out["war_t"].nunique() < 2:
@@ -205,52 +202,71 @@ def binary_metrics(y: pd.Series, probability: np.ndarray) -> dict[str, float]:
     return result
 
 
+def _fit_logit_sample(
+    sample: pd.DataFrame, features: list[str], model_name: str,
+    sample_specification: str,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    X = sm.add_constant(sample[features], has_constant="add")
+    y = sample["war_t"].astype(int)
+    try:
+        fit = sm.Logit(y, X).fit(
+            disp=False, maxiter=200, cov_type="cluster",
+            cov_kwds={"groups": sample["dyad_id"]}, warn_convergence=False,
+        )
+    except (ValueError, np.linalg.LinAlgError, FloatingPointError) as exc:
+        return [], {"model": model_name, "method": "logistic", "status": "failed",
+                    "sample_specification": sample_specification, "n": len(sample),
+                    "error": str(exc)}
+    converged = bool(fit.mle_retvals.get("converged", True))
+    ci = fit.conf_int()
+    rows = [{
+        "model": model_name, "sample_specification": sample_specification,
+        "term": term, "estimate": float(estimate),
+        "odds_ratio": float(np.exp(estimate)),
+        "or_ci_lower": float(np.exp(ci.loc[term].iloc[0])),
+        "or_ci_upper": float(np.exp(ci.loc[term].iloc[1])),
+        "std_error": float(stderr), "p_value": float(pvalue),
+        "n": len(sample), "converged": converged,
+    } for term, estimate, stderr, pvalue in zip(
+        fit.params.index, fit.params, fit.bse, fit.pvalues
+    )]
+    return rows, {
+        "model": model_name, "method": "logistic",
+        "status": "ok" if converged else "nonconverged",
+        "sample_specification": sample_specification, "n": len(sample),
+        "war_n": int(y.sum()), "minor_n": int((y == 0).sum()),
+        "unique_dyads": int(sample["dyad_id"].nunique()),
+        "unique_conflicts": int(sample["conflict_id"].nunique())
+        if "conflict_id" in sample else np.nan,
+        "pseudo_r2": float(fit.prsquared), "aic": float(fit.aic),
+        "converged": converged,
+        "warning": "" if converged else "maximum_likelihood_not_converged",
+    }
+
+
 def fit_logistic(df: pd.DataFrame, output_dir: Path) -> list[dict[str, Any]]:
     coefficients: list[dict[str, Any]] = []
     metrics: list[dict[str, Any]] = []
-    for model_name, features in MODEL_FEATURES.items():
-        sample = complete_case(df, features)
-        X = sm.add_constant(sample[features], has_constant="add")
-        y = sample["war_t"].astype(int)
-        try:
-            fit = sm.Logit(y, X).fit(
-                disp=False,
-                maxiter=200,
-                cov_type="cluster",
-                cov_kwds={"groups": sample["dyad_id"]},
-                warn_convergence=False,
-            )
-        except (ValueError, np.linalg.LinAlgError) as exc:
-            metrics.append({"model": model_name, "method": "logistic", "status": "failed",
-                            "n": len(sample), "error": str(exc)})
-            continue
-        converged = bool(fit.mle_retvals.get("converged", True))
-        probability = fit.predict(X)
-        metrics.append({"model": model_name, "method": "logistic",
-                        "status": "ok" if converged else "nonconverged",
-                        **binary_metrics(y, probability),
-                        "pseudo_r2": float(fit.prsquared),
-                        "aic": float(fit.aic),
-                        "converged": converged,
-                        "warning": "" if converged else "maximum_likelihood_not_converged"})
-        for term, estimate, stderr, pvalue in zip(
-                fit.params.index, fit.params, fit.bse, fit.pvalues):
-            coefficients.append({
-                "model": model_name,
-                "term": term,
-                "estimate": float(estimate),
-                "odds_ratio": float(np.exp(estimate)),
-                "std_error": float(stderr),
-                "p_value": float(pvalue),
-                "n": len(sample),
-            })
+    m1_sample = complete_case(df, MODEL_FEATURES["M1"])
+    m4_sample = complete_case(df, MODEL_FEATURES["M4"])
+    specifications = [
+        ({"M0": MODEL_FEATURES["M0"], "M1": MODEL_FEATURES["M1"]},
+         m1_sample, "primary_m1_common"),
+        ({f"{name}_adjusted": features for name, features in MODEL_FEATURES.items()},
+         m4_sample, "adjusted_m4_common"),
+    ]
+    for model_set, sample, specification in specifications:
+        for model_name, features in model_set.items():
+            rows, metric = _fit_logit_sample(sample, features, model_name, specification)
+            coefficients.extend(rows)
+            metrics.append(metric)
     pd.DataFrame(coefficients).to_csv(output_dir / "logistic_coefficients.csv", index=False)
     return metrics
 
 
 def _fit_binary_specification(
     sample: pd.DataFrame, features: list[str], outcome: str, model_name: str,
-    hypothesis: str,
+    hypothesis: str, extra_metric: dict[str, Any] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     sample = sample.replace([np.inf, -np.inf], np.nan).dropna(
         subset=[outcome, "dyad_id", *features]
@@ -270,12 +286,15 @@ def _fit_binary_specification(
         return [], {"model": model_name, "hypothesis": hypothesis, "status": "failed",
                     "n": len(sample), "error": str(exc)}
     converged = bool(fit.mle_retvals.get("converged", True))
+    ci = fit.conf_int()
     rows = [{
         "model": model_name,
         "hypothesis": hypothesis,
         "term": term,
         "estimate": float(estimate),
         "odds_ratio": float(np.exp(estimate)),
+        "or_ci_lower": float(np.exp(ci.loc[term].iloc[0])),
+        "or_ci_upper": float(np.exp(ci.loc[term].iloc[1])),
         "std_error": float(stderr),
         "p_value": float(pvalue),
         "n": len(sample),
@@ -283,13 +302,16 @@ def _fit_binary_specification(
     } for term, estimate, stderr, pvalue in zip(
         fit.params.index, fit.params, fit.bse, fit.pvalues
     )]
-    return rows, {
+    metric = {
         "model": model_name, "hypothesis": hypothesis,
         "status": "ok" if converged else "nonconverged",
         "n": len(sample), "pseudo_r2": float(fit.prsquared), "aic": float(fit.aic),
         "converged": converged,
         "warning": "" if converged else "maximum_likelihood_not_converged",
     }
+    if extra_metric:
+        metric.update(extra_metric)
+    return rows, metric
 
 
 def fit_support_hypotheses(df: pd.DataFrame, output_dir: Path) -> None:
@@ -307,15 +329,30 @@ def fit_support_hypotheses(df: pd.DataFrame, output_dir: Path) -> None:
         coefficient_rows.extend(rows)
         metric_rows.append(metric)
 
-    config = df.copy()
+    valid_categories = ["none", "one_side_only", "both_sides"]
+    excluded = (~df["support_configuration_confirmed"].isin(valid_categories)).sum()
+    config = df[df["support_configuration_confirmed"].isin(valid_categories)].copy()
     config["support_one_side"] = (config["support_configuration_confirmed"] == "one_side_only").astype(int)
     config["support_both_sides"] = (config["support_configuration_confirmed"] == "both_sides").astype(int)
     rows, metric = _fit_binary_specification(
         config, baseline + ["support_one_side", "support_both_sides"],
         "war_t", "H3_support_configuration", "support_configuration",
+        {"h3_excluded_invalid_categories": int(excluded),
+         "h3_reference_category": "none"},
     )
     coefficient_rows.extend(rows)
     metric_rows.append(metric)
+    h2_rows = [row for row in coefficient_rows
+               if row["hypothesis"] == "support_type"
+               and row["term"] in SUPPORT_TYPE_FEATURES]
+    if h2_rows:
+        _, corrected, _, _ = multipletests(
+            [row["p_value"] for row in h2_rows], method="fdr_bh"
+        )
+        correction = {row["term"]: float(value) for row, value in zip(h2_rows, corrected)}
+        for row in coefficient_rows:
+            if row["hypothesis"] == "support_type" and row["term"] in correction:
+                row["p_value_fdr_bh"] = correction[row["term"]]
 
     escalation = df[df["lag_intensity"].eq(1)].copy()
     rows, metric = _fit_binary_specification(
