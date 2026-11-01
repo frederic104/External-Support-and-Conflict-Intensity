@@ -21,6 +21,7 @@ from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 from statsmodels.stats.multitest import multipletests
 from statsmodels.tools.sm_exceptions import ConvergenceWarning
+from statsmodels.stats.outliers_influence import variance_inflation_factor
 from xgboost import XGBClassifier
 import shap
 
@@ -30,14 +31,20 @@ MODEL_FEATURES: dict[str, list[str]] = {
     "M0": ["lag_intensity", "lag_conflict_type", "lag_episode_age_years", "year"],
     "M1": ["lag_intensity", "lag_conflict_type", "lag_episode_age_years", "year",
            "n_support_types_confirmed"],
-    "M2": ["lag_intensity", "lag_conflict_type", "lag_episode_age_years", "year",
-           "n_support_types_confirmed", "cinc", "population"],
-    "M3": ["lag_intensity", "lag_conflict_type", "lag_episode_age_years", "year",
-           "n_support_types_confirmed", "cinc", "population", "gdp_per_capita"],
-    "M4": ["lag_intensity", "lag_conflict_type", "lag_episode_age_years", "year",
-           "n_support_types_confirmed", "cinc", "population", "gdp_per_capita",
-           "v2x_polyarchy"],
+    "M2_CINC": ["lag_intensity", "lag_conflict_type", "lag_episode_age_years", "year",
+                "n_support_types_confirmed", "cinc"],
+    "M3_GDP": ["lag_intensity", "lag_conflict_type", "lag_episode_age_years", "year",
+               "n_support_types_confirmed", "gdp_per_capita"],
+    "M4_VDEM": ["lag_intensity", "lag_conflict_type", "lag_episode_age_years", "year",
+                "n_support_types_confirmed", "v2x_polyarchy"],
+    "M2_POP_ALT": ["lag_intensity", "lag_conflict_type", "lag_episode_age_years", "year",
+                   "n_support_types_confirmed", "log_population"],
 }
+ADJUSTED_SAMPLE_FEATURES = [
+    "lag_intensity", "lag_conflict_type", "lag_episode_age_years", "year",
+    "n_support_types_confirmed", "cinc", "population", "gdp_per_capita",
+    "v2x_polyarchy", "log_population",
+]
 SUPPORT_TYPE_FEATURES = [
     "ext_x_confirmed", "ext_p_confirmed", "ext_y_confirmed", "ext_w_confirmed",
     "ext_m_confirmed", "ext_t_confirmed", "ext_f_confirmed", "ext_i_confirmed",
@@ -321,12 +328,24 @@ def fit_logistic(df: pd.DataFrame, output_dir: Path) -> list[dict[str, Any]]:
     coefficients: list[dict[str, Any]] = []
     metrics: list[dict[str, Any]] = []
     m1_sample = complete_case(df, MODEL_FEATURES["M1"])
-    m4_sample = complete_case(df, MODEL_FEATURES["M4"])
+    adjusted = df.copy()
+    adjusted["log_population"] = np.where(
+        pd.to_numeric(adjusted["population"], errors="coerce") > 0,
+        np.log(pd.to_numeric(adjusted["population"], errors="coerce")),
+        np.nan,
+    )
+    adjusted_sample = complete_case(adjusted, ADJUSTED_SAMPLE_FEATURES)
+    _write_control_diagnostics(adjusted_sample, output_dir)
     specifications = [
         ({"M0": MODEL_FEATURES["M0"], "M1": MODEL_FEATURES["M1"]},
          m1_sample, "primary_m1_common"),
-        ({f"{name}_adjusted": features for name, features in MODEL_FEATURES.items()},
-         m4_sample, "adjusted_m4_common"),
+        ({"M0_adjusted": MODEL_FEATURES["M0"],
+          "M1_adjusted": MODEL_FEATURES["M1"],
+          "M2_CINC": MODEL_FEATURES["M2_CINC"],
+          "M3_GDP": MODEL_FEATURES["M3_GDP"],
+          "M4_VDEM": MODEL_FEATURES["M4_VDEM"],
+          "M2_POP_ALT": MODEL_FEATURES["M2_POP_ALT"]},
+         adjusted_sample, "adjusted_alternatives_common"),
     ]
     for model_set, sample, specification in specifications:
         for model_name, features in model_set.items():
@@ -335,6 +354,37 @@ def fit_logistic(df: pd.DataFrame, output_dir: Path) -> list[dict[str, Any]]:
             metrics.append(metric)
     pd.DataFrame(coefficients).to_csv(output_dir / "logistic_coefficients.csv", index=False)
     return metrics
+
+
+def _write_control_diagnostics(sample: pd.DataFrame, output_dir: Path) -> None:
+    diagnostic_features = [
+        "cinc", "population", "gdp_per_capita", "v2x_polyarchy", "log_population",
+    ]
+    correlations = sample[diagnostic_features].corr(method="spearman")
+    correlations.to_csv(output_dir / "control_spearman_correlations.csv")
+
+    vif_rows: list[dict[str, Any]] = []
+    for model_name in ("M2_CINC", "M3_GDP", "M4_VDEM", "M2_POP_ALT"):
+        features = MODEL_FEATURES[model_name]
+        design = sample[features].astype(float)
+        try:
+            values = [
+                variance_inflation_factor(design.to_numpy(), index)
+                for index in range(design.shape[1])
+            ]
+            error = ""
+        except (ValueError, np.linalg.LinAlgError, FloatingPointError) as exc:
+            values = [np.nan] * len(features)
+            error = str(exc)
+        vif_rows.extend({
+            "model": model_name,
+            "feature": feature,
+            "vif": float(value),
+            "error": error,
+            "n": len(sample),
+            "war_n": int(sample["war_t"].sum()),
+        } for feature, value in zip(features, values))
+    pd.DataFrame(vif_rows).to_csv(output_dir / "control_vif.csv", index=False)
 
 
 def _fit_binary_specification(
