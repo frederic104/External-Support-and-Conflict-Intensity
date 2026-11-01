@@ -3,7 +3,9 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+import numpy as np
 import pandas as pd
+import statsmodels.api as sm
 
 from src import analyze_models
 from src.pipeline import build_esd_features, dyadic_schema, esd_schema
@@ -141,10 +143,13 @@ class TestAnalysisPolicy(unittest.TestCase):
             with mock.patch.object(
                 analyze_models, "_fit_binary_specification",
                 side_effect=lambda *args, **kwargs: (
-                    [{"model": args[3], "hypothesis": args[4], "term": "const", "p_value": 0.5},
-                     {"model": args[3], "hypothesis": args[4], "term": args[1][-1], "p_value": 0.01},
-                     {"model": args[3], "hypothesis": args[4], "term": "year", "p_value": 0.5}],
-                    {"model": args[3], "hypothesis": args[4]},
+                    [{"model": args[3], "hypothesis": args[4], "term": "const", "p_value": 0.5,
+                      "inference_status": "valid"},
+                     {"model": args[3], "hypothesis": args[4], "term": args[1][-1], "p_value": 0.01,
+                      "inference_status": "valid"},
+                     {"model": args[3], "hypothesis": args[4], "term": "year", "p_value": 0.5,
+                      "inference_status": "valid"}],
+                    {"model": args[3], "hypothesis": args[4], "status": "ok"},
                 ),
             ):
                 analyze_models.fit_support_hypotheses(df, Path(tmp))
@@ -157,6 +162,90 @@ class TestAnalysisPolicy(unittest.TestCase):
         non_h2 = coefficients[~coefficients["hypothesis"].eq("support_type")]
         self.assertTrue(non_h2["p_value_fdr_bh"].isna().all())
         self.assertTrue(coefficients.loc[coefficients["term"].isin(["const", "year"]), "p_value_fdr_bh"].isna().all())
+
+    def test_h2_nonconverged_model_is_non_estimable_with_nan_inference(self):
+        class FakeResult:
+            mle_retvals = {"converged": False}
+            params = pd.Series([1.0], index=["const"])
+            bse = pd.Series([0.1], index=["const"])
+            pvalues = pd.Series([0.1], index=["const"])
+
+            def conf_int(self):
+                return pd.DataFrame({0: [-1.0], 1: [1.0]}, index=["const"])
+
+        fake_logit = mock.Mock()
+        fake_logit.fit.return_value = FakeResult()
+        with mock.patch.object(sm, "Logit", return_value=fake_logit):
+            rows, metric = analyze_models._fit_binary_specification(
+                make_analysis_sample(30),
+                analyze_models.MODEL_FEATURES["M0"],
+                "war_t", "H2_ext_x", "support_type",
+            )
+        self.assertEqual(metric["status"], "non_estimable")
+        self.assertEqual(metric["inference_error"], "maximum_likelihood_not_converged")
+        self.assertTrue(pd.isna(rows[0]["odds_ratio"]))
+        self.assertTrue(pd.isna(rows[0]["p_value"]))
+        self.assertEqual(rows[0]["inference_status"], "non_estimable")
+
+    def test_h2_nonfinite_standard_errors_are_non_estimable(self):
+        class FakeResult:
+            mle_retvals = {"converged": True}
+            params = pd.Series([1.0], index=["const"])
+            bse = pd.Series([float("nan")], index=["const"])
+            pvalues = pd.Series([0.1], index=["const"])
+
+            def conf_int(self):
+                return pd.DataFrame({0: [-1.0], 1: [1.0]}, index=["const"])
+
+        fake_logit = mock.Mock()
+        fake_logit.fit.return_value = FakeResult()
+        with mock.patch.object(sm, "Logit", return_value=fake_logit):
+            rows, metric = analyze_models._fit_binary_specification(
+                make_analysis_sample(30),
+                analyze_models.MODEL_FEATURES["M0"],
+                "war_t", "H2_ext_x", "support_type",
+            )
+        self.assertEqual(metric["status"], "non_estimable")
+        self.assertEqual(metric["inference_error"], "non_finite_standard_errors")
+        self.assertTrue(pd.isna(rows[0]["or_ci_lower"]))
+        self.assertTrue(pd.isna(rows[0]["p_value"]))
+
+    def test_h2_fdr_excludes_non_estimable_model_and_reports_counts(self):
+        df = make_analysis_sample(30)
+
+        def fake_fit(sample, features, outcome, model_name, hypothesis, extra_metric=None):
+            target = features[-1]
+            failed = model_name == "H2_ext_x"
+            rows = [
+                {
+                    "model": model_name, "hypothesis": hypothesis, "term": target,
+                    "p_value": np.nan if failed else 0.01,
+                    "inference_status": "non_estimable" if failed else "valid",
+                    "odds_ratio": np.nan if failed else 1.5,
+                }
+            ]
+            metric = {
+                "model": model_name, "hypothesis": hypothesis,
+                "status": "non_estimable" if failed else "ok",
+                "converged": not failed,
+            }
+            return rows, metric
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(
+                analyze_models, "_fit_binary_specification", side_effect=fake_fit
+            ):
+                analyze_models.fit_support_hypotheses(df, Path(tmp))
+            coefficients = pd.read_csv(Path(tmp) / "support_hypothesis_coefficients.csv")
+            metrics = pd.read_csv(Path(tmp) / "support_hypothesis_metrics.csv")
+        h2 = coefficients[coefficients["hypothesis"].eq("support_type")]
+        self.assertTrue(pd.isna(h2.loc[h2["model"].eq("H2_ext_x"), "p_value_fdr_bh"]).all())
+        self.assertEqual(h2["p_value_fdr_bh"].notna().sum(), 9)
+        h2_metrics = metrics[metrics["hypothesis"].eq("support_type")]
+        self.assertTrue((h2_metrics["h2_attempted"] == 10).all())
+        self.assertTrue((h2_metrics["h2_valid"] == 9).all())
+        self.assertTrue((h2_metrics["h2_non_estimable"] == 1).all())
+        self.assertTrue((h2_metrics["h2_fdr_family_size"] == 9).all())
 
     def test_grouped_cv_writes_distinct_seed_and_fold_outputs(self):
         sample = make_analysis_sample(60)
