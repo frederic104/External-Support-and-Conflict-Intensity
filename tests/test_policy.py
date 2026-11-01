@@ -31,7 +31,7 @@ class TestIntegrationPolicy(unittest.TestCase):
 
     def test_both_sides_means_any_support_to_each_side(self):
         dy_raw = pd.DataFrame({
-            "DyadID": ["1"], "Year": [2000], "Int": [1], "Type": [4],
+            "DyadID": ["1"], "ConflictID": [100], "Year": [2000], "Int": [1], "Type": [4],
             "CountryA": ["Lebanon"], "CountryB": [""], "Location": ["Lebanon"],
             "GWNoA": [660], "SideAID": [10], "SideBID": [20]
         })
@@ -51,7 +51,7 @@ class TestIntegrationPolicy(unittest.TestCase):
 
     def test_explicit_no_support_authorizes_zero_filling_detail_blanks(self):
         dy_raw = pd.DataFrame({
-            "DyadID": ["1"], "Year": [2000], "Int": [1], "Type": [4],
+            "DyadID": ["1"], "ConflictID": [100], "Year": [2000], "Int": [1], "Type": [4],
             "CountryA": ["Lebanon"], "CountryB": [""], "Location": ["Lebanon"],
             "GWNoA": [660], "SideAID": [10], "SideBID": [20]
         })
@@ -67,7 +67,7 @@ class TestIntegrationPolicy(unittest.TestCase):
 
     def test_exact_previous_year_pairing_does_not_bridge_a_gap(self):
         dy_raw = pd.DataFrame({
-            "DyadID": [1, 1], "Year": [2000, 2002], "Int": [1, 2], "Type": [4, 4],
+            "DyadID": [1, 1], "ConflictID": [100, 100], "Year": [2000, 2002], "Int": [1, 2], "Type": [4, 4],
             "CountryA": ["Lebanon", "Lebanon"], "CountryB": ["", ""], "Location": ["Lebanon", "Lebanon"],
             "GWNoA": [660, 660], "SideAID": [10, 10], "SideBID": [20, 20]
         })
@@ -81,7 +81,7 @@ class TestIntegrationPolicy(unittest.TestCase):
 
     def test_supported_type_missing_fails_closed(self):
         dy_raw = pd.DataFrame({
-            "DyadID": [1], "Year": [2000], "Int": [1], "Type": [4],
+            "DyadID": [1], "ConflictID": [100], "Year": [2000], "Int": [1], "Type": [4],
             "CountryA": ["Lebanon"], "CountryB": [""], "Location": ["Lebanon"],
             "GWNoA": [660], "SideAID": [10], "SideBID": [20]
         })
@@ -96,7 +96,7 @@ class TestIntegrationPolicy(unittest.TestCase):
 
     def test_missing_supporter_id_does_not_create_partial_count(self):
         dy_raw = pd.DataFrame({
-            "DyadID": [1], "Year": [2000], "Int": [1], "Type": [4],
+            "DyadID": [1], "ConflictID": [100], "Year": [2000], "Int": [1], "Type": [4],
             "CountryA": ["Lebanon"], "CountryB": [""], "Location": ["Lebanon"],
             "GWNoA": [660], "SideAID": [10], "SideBID": [20]
         })
@@ -142,9 +142,46 @@ class TestIntegrationPolicy(unittest.TestCase):
         # through a patched ROOT-independent configuration below.
         with mock.patch("src.pipeline.ROOT", self.audit):
             cfg["files"] = {"dyadic": "dyadic.csv", "esd_ty": "esd_ty.csv", "esd_dy": "esd_dy.csv"}
-            with self.assertRaisesRegex(ValueError, "do not share one declared ID release"):
+            with self.assertRaisesRegex(ValueError, "must use project.ucdp_version"):
                 validate_core_source_set(cfg, self.audit)
         self.assertTrue((self.audit / "core_source_preflight.csv").exists())
+
+    def test_preflight_rejects_release_not_matching_project_version(self):
+        for name in ["dyadic.csv", "esd_ty.csv", "esd_dy.csv"]:
+            (self.audit / name).write_text("placeholder\n", encoding="utf-8")
+        cfg = {
+            "project": {"ucdp_version": "18.1"},
+            "files": {"dyadic": "dyadic.csv", "esd_ty": "esd_ty.csv", "esd_dy": "esd_dy.csv"},
+            "ucdp_versions": {"dyadic": "26.1", "esd_ty": "26.1", "esd_dy": "26.1"},
+        }
+        with mock.patch("src.pipeline.ROOT", self.audit):
+            with self.assertRaisesRegex(ValueError, "project.ucdp_version=18.1"):
+                validate_core_source_set(cfg, self.audit)
+
+    def test_conflict_id_is_preserved_in_current_and_lagged_panel(self):
+        dy_raw = pd.DataFrame({
+            "DyadID": [1, 1], "ConflictID": [100, 100], "Year": [2000, 2001],
+            "Int": [1, 2], "Type": [4, 4],
+            "CountryA": ["Lebanon", "Lebanon"], "CountryB": ["", ""],
+            "Location": ["Lebanon", "Lebanon"], "GWNoA": [660, 660],
+            "SideAID": [10, 10], "SideBID": [20, 20],
+        })
+        dy = dyadic_schema(dy_raw)
+        cfg = {"project": {"country_aliases": {}, "region_country_labels": ["Lebanon"],
+                           "main_conflict_types": [3, 4], "use_location_fallback_for_region": False,
+                           "outcome_year_start": 2001, "outcome_year_end": 2001}}
+        reg = get_dyadic_region(dy, cfg, self.audit)
+        panel = build_consecutive_panel(reg, cfg, self.audit)
+        self.assertEqual(panel.iloc[0]["conflict_id"], 100)
+        self.assertEqual(panel.iloc[0]["lag_conflict_id"], 100)
+
+    def test_missing_conflict_id_is_schema_error(self):
+        raw = pd.DataFrame({
+            "DyadID": [1], "Year": [2000], "Int": [1], "Type": [4],
+            "CountryA": ["Lebanon"], "SideAID": [10], "SideBID": [20],
+        })
+        with self.assertRaisesRegex(ValueError, "required canonical columns not found.*conflict_id"):
+            dyadic_schema(raw)
 
 
 
