@@ -99,6 +99,53 @@ class TestAnalysisPolicy(unittest.TestCase):
         self.assertEqual(captured["metric"]["h3_reference_category"], "none")
         self.assertEqual(captured["metric"]["h3_excluded_invalid_categories"], 2)
 
+    def test_supported_dyads_h3_uses_one_side_as_reference(self):
+        df = make_analysis_sample(12)
+        categories = [
+            "none", "one_side_only", "both_sides", "unknown",
+            "unresolved_side", "one_side_only", "both_sides",
+            "one_side_only", "both_sides", "both_sides", "one_side_only", "both_sides",
+        ]
+        df["support_configuration_confirmed"] = categories
+        original = df["support_configuration_confirmed"].copy()
+        calls = {}
+
+        def fake_fit(sample, features, outcome, model_name, hypothesis, extra_metric=None):
+            if model_name in {"H3_support_configuration", "H3_supported_dyads"}:
+                calls[model_name] = (sample.copy(), extra_metric)
+            rows = [{
+                "model": model_name, "hypothesis": hypothesis,
+                "term": features[-1], "p_value": 0.5,
+                "inference_status": "valid",
+            }]
+            return rows, {
+                "model": model_name, "hypothesis": hypothesis, "status": "ok",
+            }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(
+                analyze_models, "_fit_binary_specification", side_effect=fake_fit
+            ):
+                analyze_models.fit_support_hypotheses(df, Path(tmp))
+
+        supported, metric = calls["H3_supported_dyads"]
+        self.assertEqual(
+            set(supported["support_configuration_confirmed"]),
+            {"one_side_only", "both_sides"},
+        )
+        self.assertEqual(len(supported), 9)
+        self.assertEqual(int(supported["war_t"].sum()), int(df.loc[
+            df["support_configuration_confirmed"].isin(["one_side_only", "both_sides"]),
+            "war_t",
+        ].sum()))
+        self.assertEqual(metric["h3_reference_category"], "one_side_only")
+        self.assertEqual(metric["h3_supported_n"], 9)
+        self.assertEqual(metric["h3_supported_one_side_n"], 4)
+        self.assertEqual(metric["h3_supported_both_sides_n"], 5)
+        pd.testing.assert_series_equal(
+            original, df["support_configuration_confirmed"]
+        )
+
     def test_confirmed_breadth_excludes_ext_u_and_keeps_ext_x_ext_p_distinct(self):
         dy_raw = pd.DataFrame({
             "DyadID": [1], "ConflictID": [100], "Year": [2000], "Int": [1],
