@@ -216,6 +216,75 @@ class TestAnalysisPolicy(unittest.TestCase):
             self.assertNotIn("cinc", analyze_models.MODEL_FEATURES["M2_POP_ALT"])
             self.assertNotIn("v2x_polyarchy", analyze_models.MODEL_FEATURES["M3_GDP"])
 
+    def test_h1_sensitivity_centers_breadth_and_excludes_one_conflict_each_time(self):
+        df = make_analysis_sample(36)
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp)
+            metrics = analyze_models.fit_h1_sensitivity(df, output_dir)
+            quadratic = pd.read_csv(output_dir / "h1_quadratic_coefficients.csv")
+            conflict = pd.read_csv(output_dir / "h1_conflict_summary.csv")
+            loo = pd.read_csv(output_dir / "h1_leave_one_conflict_out.csv")
+            predictions = pd.read_csv(
+                output_dir / "h1_functional_form_predictions.csv"
+            )
+        self.assertAlmostEqual(metrics[0]["breadth_centered_mean"], 0.0)
+        expected_sq_mean = (
+            (df["n_support_types_confirmed"]
+             - df["n_support_types_confirmed"].mean()) ** 2
+        ).mean()
+        self.assertAlmostEqual(
+            metrics[0]["breadth_centered_sq_mean"], expected_sq_mean
+        )
+        self.assertIn("breadth_centered_sq", set(quadratic["term"]))
+        self.assertEqual(len(conflict), df["conflict_id"].nunique())
+        self.assertEqual(len(loo), df["conflict_id"].nunique())
+        self.assertEqual(
+            set(loo["excluded_conflict_id"]),
+            set(df["conflict_id"].unique()),
+        )
+        self.assertTrue((loo["unique_conflicts"] == df["conflict_id"].nunique() - 1).all())
+        self.assertEqual({row["sensitivity_role"] for row in metrics},
+                         {"exploratory_functional_form", "exploratory_conflict_sensitivity"})
+        self.assertTrue(predictions.empty or {
+            "breadth", "predicted_probability"
+        } <= set(predictions))
+
+    def test_primary_m1_definition_remains_linear_breadth(self):
+        self.assertEqual(
+            analyze_models.MODEL_FEATURES["M1"][-1],
+            "n_support_types_confirmed",
+        )
+        self.assertNotIn("breadth_centered", analyze_models.MODEL_FEATURES["M1"])
+        self.assertNotIn("breadth_centered_sq", analyze_models.MODEL_FEATURES["M1"])
+
+    def test_h1_leave_one_conflict_out_records_failed_fits(self):
+        df = make_analysis_sample(18)
+
+        def failed_fit(sample, features, outcome, model_name, hypothesis,
+                       extra_metric=None):
+            if model_name == "H1_leave_one_conflict_out":
+                return [], {
+                    "model": model_name, "hypothesis": hypothesis,
+                    "status": "non_estimable", "converged": False,
+                    "inference_error": "synthetic_failure",
+                }
+            return [], {
+                "model": model_name, "hypothesis": hypothesis,
+                "status": "non_estimable", "converged": False,
+                "inference_error": "synthetic_failure",
+            }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(
+                analyze_models, "_fit_binary_specification",
+                side_effect=failed_fit,
+            ):
+                analyze_models.fit_h1_sensitivity(df, Path(tmp))
+            loo = pd.read_csv(Path(tmp) / "h1_leave_one_conflict_out.csv")
+        self.assertEqual(len(loo), df["conflict_id"].nunique())
+        self.assertTrue((loo["status"] == "non_estimable").all())
+        self.assertTrue((loo["inference_error"] == "synthetic_failure").all())
+
     def test_h2_fdr_is_only_added_to_support_type_terms(self):
         df = make_analysis_sample(30)
         with tempfile.TemporaryDirectory() as tmp:
