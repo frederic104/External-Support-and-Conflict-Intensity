@@ -13,8 +13,11 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from sklearn.ensemble import RandomForestClassifier
+from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, average_precision_score, brier_score_loss, roc_auc_score
 from sklearn.model_selection import StratifiedGroupKFold
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
 from statsmodels.stats.multitest import multipletests
 from xgboost import XGBClassifier
 import shap
@@ -47,6 +50,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--test-start-year", type=int, default=2009)
     parser.add_argument("--random-state", type=int, default=42)
     parser.add_argument("--cv-splits", type=int, default=5)
+    parser.add_argument(
+        "--temporal-validation", action="store_true",
+        help="Run forward-looking temporal validation as a supplementary analysis.",
+    )
     return parser.parse_args()
 
 
@@ -136,7 +143,7 @@ def save_plots(output_dir: Path, coefficients: pd.DataFrame,
                     marker="o", linewidth=2, label=label)
         ax.set_ylim(0, 1)
         ax.set_ylabel("Score")
-        ax.set_title("Predictive performance across temporal validation folds")
+        ax.set_title("Predictive performance across dyad-grouped CV folds")
         ax.legend(frameon=False)
         ax.grid(axis="y", alpha=0.2)
         fig.tight_layout()
@@ -190,16 +197,29 @@ def save_plots(output_dir: Path, coefficients: pd.DataFrame,
 
 def binary_metrics(y: pd.Series, probability: np.ndarray) -> dict[str, float]:
     predicted = (probability >= 0.5).astype(int)
+    has_both_classes = y.nunique() == 2
     result = {
         "n": int(len(y)),
+        "n_war": int(y.sum()),
+        "n_minor": int((y == 0).sum()),
+        "war_prevalence": float(y.mean()),
         "accuracy": float(accuracy_score(y, predicted)),
         "brier": float(brier_score_loss(y, probability)),
     }
-    result["roc_auc"] = float(roc_auc_score(y, probability)) if y.nunique() == 2 else np.nan
+    result["roc_auc"] = float(roc_auc_score(y, probability)) if has_both_classes else np.nan
     result["average_precision"] = (
-        float(average_precision_score(y, probability)) if y.nunique() == 2 else np.nan
+        float(average_precision_score(y, probability)) if has_both_classes else np.nan
     )
     return result
+
+
+def _safe_exp(value: float) -> float:
+    with np.errstate(over="ignore", invalid="ignore"):
+        return float(np.exp(value))
+
+
+def _ci_status(lower: float, upper: float) -> str:
+    return "finite" if np.isfinite(lower) and np.isfinite(upper) else "unbounded"
 
 
 def _fit_logit_sample(
@@ -222,9 +242,12 @@ def _fit_logit_sample(
     rows = [{
         "model": model_name, "sample_specification": sample_specification,
         "term": term, "estimate": float(estimate),
-        "odds_ratio": float(np.exp(estimate)),
-        "or_ci_lower": float(np.exp(ci.loc[term].iloc[0])),
-        "or_ci_upper": float(np.exp(ci.loc[term].iloc[1])),
+        "odds_ratio": _safe_exp(estimate),
+        "or_ci_lower": _safe_exp(ci.loc[term].iloc[0]),
+        "or_ci_upper": _safe_exp(ci.loc[term].iloc[1]),
+        "ci_status": _ci_status(
+            _safe_exp(ci.loc[term].iloc[0]), _safe_exp(ci.loc[term].iloc[1])
+        ),
         "std_error": float(stderr), "p_value": float(pvalue),
         "n": len(sample), "converged": converged,
     } for term, estimate, stderr, pvalue in zip(
@@ -292,9 +315,12 @@ def _fit_binary_specification(
         "hypothesis": hypothesis,
         "term": term,
         "estimate": float(estimate),
-        "odds_ratio": float(np.exp(estimate)),
-        "or_ci_lower": float(np.exp(ci.loc[term].iloc[0])),
-        "or_ci_upper": float(np.exp(ci.loc[term].iloc[1])),
+        "odds_ratio": _safe_exp(estimate),
+        "or_ci_lower": _safe_exp(ci.loc[term].iloc[0]),
+        "or_ci_upper": _safe_exp(ci.loc[term].iloc[1]),
+        "ci_status": _ci_status(
+            _safe_exp(ci.loc[term].iloc[0]), _safe_exp(ci.loc[term].iloc[1])
+        ),
         "std_error": float(stderr),
         "p_value": float(pvalue),
         "n": len(sample),
@@ -371,151 +397,6 @@ def fit_support_hypotheses(df: pd.DataFrame, output_dir: Path) -> None:
     )
 
 
-def fit_predictive_models(
-    df: pd.DataFrame, output_dir: Path, test_start_year: int,
-    random_state: int, cv_splits: int,
-) -> tuple[list[dict[str, Any]], np.ndarray | None, pd.DataFrame | None]:
-    features = MODEL_FEATURES["M4"]
-    sample = complete_case(df, features)
-    train = sample[sample["year"] < test_start_year].copy()
-    test = sample[sample["year"] >= test_start_year].copy()
-    if train.empty or test.empty or train["war_t"].nunique() < 2 or test["war_t"].nunique() < 2:
-        raise ValueError(
-            f"Time split at {test_start_year} must leave both classes in train and test; "
-            f"train={len(train)}, test={len(test)}."
-        )
-    X_train, X_test = train[features], test[features]
-    y_train, y_test = train["war_t"].astype(int), test["war_t"].astype(int)
-    models = {
-        "random_forest": RandomForestClassifier(
-            n_estimators=500, min_samples_leaf=2, class_weight="balanced",
-            random_state=random_state, n_jobs=-1,
-        ),
-        "xgboost": XGBClassifier(
-            n_estimators=300, max_depth=2, learning_rate=0.05,
-            subsample=0.8, colsample_bytree=0.8, min_child_weight=2,
-            objective="binary:logistic", eval_metric="logloss",
-            random_state=random_state, n_jobs=1,
-        ),
-    }
-    metrics: list[dict[str, Any]] = []
-    importance_rows: list[dict[str, Any]] = []
-    shap_values_out = None
-    shap_features_out = None
-    for name, estimator in models.items():
-        estimator.fit(X_train, y_train)
-        probability = estimator.predict_proba(X_test)[:, 1]
-        metrics.append({
-            "model": name,
-            "method": "predictive",
-            "status": "ok",
-            "train_n": len(train),
-            "test_n": len(test),
-            "test_year_min": int(test["year"].min()),
-            "test_year_max": int(test["year"].max()),
-            **{f"test_{key}": value for key, value in binary_metrics(y_test, probability).items()
-               if key != "n"},
-        })
-        for feature, value in zip(features, estimator.feature_importances_):
-            importance_rows.append({"model": name, "feature": feature, "importance": float(value)})
-        if name == "xgboost":
-            explainer = shap.TreeExplainer(estimator)
-            shap_values = explainer.shap_values(X_test)
-            if isinstance(shap_values, list):
-                shap_values = shap_values[-1]
-            shap_frame = pd.DataFrame(shap_values, columns=features)
-            shap_frame.insert(0, "dyad_id", test["dyad_id"].to_numpy())
-            if "year" not in shap_frame.columns:
-                shap_frame.insert(1, "year", test["year"].to_numpy())
-            shap_frame.to_csv(output_dir / "xgboost_shap_values.csv", index=False)
-            shap_values_out = shap_values
-            shap_features_out = X_test.copy()
-            shap_importance = pd.DataFrame({
-                "feature": features,
-                "mean_abs_shap": np.abs(shap_values).mean(axis=0),
-            }).sort_values("mean_abs_shap", ascending=False)
-            shap_importance.to_csv(output_dir / "xgboost_shap_importance.csv", index=False)
-    pd.DataFrame(importance_rows).to_csv(output_dir / "tree_feature_importance.csv", index=False)
-    cv_summary = grouped_cross_validation(
-        sample, features, output_dir, random_state, n_splits=cv_splits
-    )
-    cv_summary.extend(temporal_cross_validation(
-        sample, features, output_dir, random_state, test_start_year
-    ))
-    metrics.extend(cv_summary)
-    return metrics, shap_values_out, shap_features_out
-
-
-def _predictive_estimator(model_name: str, seed: int) -> Any:
-    if model_name == "random_forest":
-        return RandomForestClassifier(
-            n_estimators=400, min_samples_leaf=2, class_weight="balanced",
-            random_state=seed, n_jobs=-1,
-        )
-    return XGBClassifier(
-        n_estimators=250, max_depth=2, learning_rate=0.05,
-        subsample=0.8, colsample_bytree=0.8, min_child_weight=2,
-        objective="binary:logistic", eval_metric="logloss",
-        random_state=seed, n_jobs=1,
-    )
-
-
-def grouped_cross_validation(
-    sample: pd.DataFrame, features: list[str], output_dir: Path,
-    random_state: int, n_splits: int,
-) -> list[dict[str, Any]]:
-    """Evaluate models on dyad-held-out, class-stratified folds."""
-    if n_splits < 2 or sample["dyad_id"].nunique() < n_splits:
-        raise ValueError("Grouped CV requires at least as many dyads as folds.")
-    splitter = StratifiedGroupKFold(
-        n_splits=n_splits, shuffle=True, random_state=random_state
-    )
-    rows: list[dict[str, Any]] = []
-    X, y, groups = sample[features], sample["war_t"].astype(int), sample["dyad_id"]
-    for fold_id, (train_idx, test_idx) in enumerate(
-        splitter.split(X, y, groups=groups), start=1
-    ):
-        train, test = sample.iloc[train_idx], sample.iloc[test_idx]
-        for model_name in ("random_forest", "xgboost"):
-            for repetition, seed in enumerate(
-                [random_state, random_state + 101, random_state + 202], start=1
-            ):
-                estimator = _predictive_estimator(model_name, seed)
-                estimator.fit(train[features], train["war_t"].astype(int))
-                probability = estimator.predict_proba(test[features])[:, 1]
-                result = binary_metrics(test["war_t"].astype(int), probability)
-                rows.append({
-                    "fold": fold_id,
-                    "model": model_name,
-                    "repetition": repetition,
-                    "train_n": len(train),
-                    "test_n": len(test),
-                    "train_dyads": train["dyad_id"].nunique(),
-                    "test_dyads": test["dyad_id"].nunique(),
-                    **{key: value for key, value in result.items() if key != "n"},
-                })
-    fold_frame = pd.DataFrame(rows)
-    fold_frame.to_csv(output_dir / "grouped_cv_metrics.csv", index=False)
-    summary = fold_frame.groupby("model").agg(
-        folds=("fold", "nunique"),
-        repetitions=("repetition", "count"),
-        train_n_mean=("train_n", "mean"),
-        test_n_mean=("test_n", "mean"),
-        test_dyads_mean=("test_dyads", "mean"),
-        roc_auc_mean=("roc_auc", "mean"),
-        roc_auc_sd=("roc_auc", "std"),
-        average_precision_mean=("average_precision", "mean"),
-        average_precision_sd=("average_precision", "std"),
-        brier_mean=("brier", "mean"),
-        brier_sd=("brier", "std"),
-        accuracy_mean=("accuracy", "mean"),
-        accuracy_sd=("accuracy", "std"),
-    ).reset_index()
-    summary.insert(1, "method", "predictive_group_cv")
-    summary["status"] = "ok"
-    return summary.to_dict("records")
-
-
 def temporal_cross_validation(
     sample: pd.DataFrame, features: list[str], output_dir: Path,
     random_state: int, first_test_year: int,
@@ -588,6 +469,192 @@ def temporal_cross_validation(
     return summary.to_dict("records")
 
 
+PREDICTIVE_SPECS: dict[str, list[str]] = {
+    "baseline": MODEL_FEATURES["M0"],
+    "extended": MODEL_FEATURES["M1"],
+}
+PREDICTIVE_MODELS = ("l2_logistic", "random_forest", "xgboost")
+
+
+def _predictive_estimator(model_name: str, seed: int) -> Any:
+    if model_name == "l2_logistic":
+        return make_pipeline(
+            StandardScaler(),
+            LogisticRegression(
+                penalty="l2", C=1.0, solver="liblinear",
+                max_iter=1000, random_state=seed,
+            ),
+        )
+    if model_name == "random_forest":
+        return RandomForestClassifier(
+            n_estimators=400, min_samples_leaf=2, class_weight="balanced",
+            random_state=seed, n_jobs=-1,
+        )
+    return XGBClassifier(
+        n_estimators=250, max_depth=2, learning_rate=0.05,
+        subsample=0.8, colsample_bytree=0.8, min_child_weight=2,
+        objective="binary:logistic", eval_metric="logloss",
+        random_state=seed, n_jobs=1,
+    )
+
+
+def grouped_cross_validation(
+    sample: pd.DataFrame, output_dir: Path, random_state: int, n_splits: int,
+) -> tuple[list[dict[str, Any]], np.ndarray | None, pd.DataFrame | None]:
+    """Compare baseline and extended specifications on identical dyad-held-out folds."""
+    if n_splits < 2 or sample["dyad_id"].nunique() < n_splits:
+        raise ValueError("Grouped CV requires at least as many dyads as folds.")
+    splitter = StratifiedGroupKFold(
+        n_splits=n_splits, shuffle=True, random_state=random_state
+    )
+    y = sample["war_t"].astype(int)
+    groups = sample["dyad_id"]
+    folds: list[dict[str, Any]] = []
+    shap_rows: list[pd.DataFrame] = []
+    importance_rows: list[dict[str, Any]] = []
+    seed_values = [random_state, random_state + 101, random_state + 202]
+    for fold_id, (train_idx, test_idx) in enumerate(
+        splitter.split(sample[PREDICTIVE_SPECS["extended"]], y, groups), start=1
+    ):
+        train, test = sample.iloc[train_idx], sample.iloc[test_idx]
+        if set(train["dyad_id"]) & set(test["dyad_id"]):
+            raise RuntimeError(f"Dyad leakage detected in fold {fold_id}.")
+        for spec_name, features in PREDICTIVE_SPECS.items():
+            for model_name in PREDICTIVE_MODELS:
+                seed_results: list[dict[str, Any]] = []
+                for repetition, seed in enumerate(seed_values, start=1):
+                    if train["war_t"].nunique() < 2:
+                        seed_results.append({
+                            "fold": fold_id, "specification": spec_name,
+                            "model": model_name, "repetition": repetition,
+                            "status": "not_estimable",
+                        })
+                        continue
+                    estimator = _predictive_estimator(model_name, seed)
+                    estimator.fit(train[features], train["war_t"].astype(int))
+                    probability = estimator.predict_proba(test[features])[:, 1]
+                    result = binary_metrics(test["war_t"].astype(int), probability)
+                    seed_results.append({
+                        "fold": fold_id, "specification": spec_name,
+                        "model": model_name, "repetition": repetition,
+                        "status": "ok", "train_n": len(train), "test_n": len(test),
+                        "train_dyads": train["dyad_id"].nunique(),
+                        "test_dyads": test["dyad_id"].nunique(),
+                        "train_n_war": int(train["war_t"].sum()),
+                        "train_n_minor": int((train["war_t"] == 0).sum()),
+                        "test_n_war": int(test["war_t"].sum()),
+                        "test_n_minor": int((test["war_t"] == 0).sum()),
+                        "test_war_prevalence": float(test["war_t"].mean()),
+                        **{key: value for key, value in result.items()
+                           if key not in {"n", "n_war", "n_minor", "war_prevalence"}},
+                    })
+                    if spec_name == "extended" and model_name == "xgboost" and repetition == 1:
+                        values = shap.TreeExplainer(estimator).shap_values(test[features])
+                        if isinstance(values, list):
+                            values = values[-1]
+                        frame = pd.DataFrame(values, columns=features)
+                        frame.insert(0, "fold", fold_id)
+                        frame.insert(1, "dyad_id", test["dyad_id"].to_numpy())
+                        if "year" not in frame.columns:
+                            frame.insert(2, "year", test["year"].to_numpy())
+                        else:
+                            frame.insert(2, "observation_year", test["year"].to_numpy())
+                        shap_rows.append(frame)
+                    if hasattr(estimator, "feature_importances_"):
+                        importance_rows.extend(
+                            {"fold": fold_id, "specification": spec_name,
+                             "model": model_name, "feature": feature,
+                             "importance": float(value)}
+                            for feature, value in zip(features, estimator.feature_importances_)
+                        )
+                folds.extend(seed_results)
+    seed_frame = pd.DataFrame(folds)
+    seed_frame.to_csv(output_dir / "grouped_cv_seed_metrics.csv", index=False)
+    if seed_frame.empty:
+        return [], None, None
+    fold_frame = (
+        seed_frame[seed_frame["status"].eq("ok")]
+        .groupby(["fold", "specification", "model"], as_index=False)
+        .agg(
+            train_n=("train_n", "first"), test_n=("test_n", "first"),
+            train_dyads=("train_dyads", "first"), test_dyads=("test_dyads", "first"),
+            train_n_war=("train_n_war", "first"), train_n_minor=("train_n_minor", "first"),
+            test_n_war=("test_n_war", "first"), test_n_minor=("test_n_minor", "first"),
+            test_war_prevalence=("test_war_prevalence", "first"),
+            roc_auc=("roc_auc", "mean"), average_precision=("average_precision", "mean"),
+            brier=("brier", "mean"), accuracy=("accuracy", "mean"),
+        )
+    )
+    fold_frame.to_csv(output_dir / "grouped_cv_fold_metrics.csv", index=False)
+    summaries = fold_frame.groupby(["specification", "model"]).agg(
+        folds=("fold", "nunique"), train_n_mean=("train_n", "mean"),
+        test_n_mean=("test_n", "mean"), test_dyads_mean=("test_dyads", "mean"),
+        roc_auc_mean=("roc_auc", "mean"), roc_auc_sd=("roc_auc", "std"),
+        average_precision_mean=("average_precision", "mean"),
+        average_precision_sd=("average_precision", "std"),
+        brier_mean=("brier", "mean"), brier_sd=("brier", "std"),
+        accuracy_mean=("accuracy", "mean"), accuracy_sd=("accuracy", "std"),
+    ).reset_index()
+    summaries.insert(1, "method", "predictive_group_cv")
+    summaries["status"] = "ok"
+    pivot = fold_frame.pivot_table(
+        index="fold", columns=["specification", "model"],
+        values=["average_precision", "brier"], aggfunc="first",
+    )
+    for model_name in PREDICTIVE_MODELS:
+        if ("average_precision", "baseline", model_name) in pivot and (
+            "average_precision", "extended", model_name
+        ) in pivot:
+            summaries.loc[
+                (summaries["model"] == model_name) & (summaries["specification"] == "extended"),
+                "delta_ap_vs_baseline",
+            ] = float(
+                pivot[("average_precision", "extended", model_name)].mean()
+                - pivot[("average_precision", "baseline", model_name)].mean()
+            )
+            summaries.loc[
+                (summaries["model"] == model_name) & (summaries["specification"] == "extended"),
+                "delta_brier_vs_baseline",
+            ] = float(
+                pivot[("brier", "extended", model_name)].mean()
+                - pivot[("brier", "baseline", model_name)].mean()
+            )
+    shap_values = pd.concat(shap_rows, ignore_index=True) if shap_rows else None
+    if shap_values is not None:
+        shap_features = shap_values[PREDICTIVE_SPECS["extended"]]
+        shap_matrix = shap_features.to_numpy()
+        shap_values.to_csv(output_dir / "xgboost_shap_values.csv", index=False)
+        pd.DataFrame({
+            "feature": PREDICTIVE_SPECS["extended"],
+            "mean_abs_shap": np.abs(shap_matrix).mean(axis=0),
+        }).sort_values("mean_abs_shap", ascending=False).to_csv(
+            output_dir / "xgboost_shap_importance.csv", index=False
+        )
+    pd.DataFrame(importance_rows).to_csv(
+        output_dir / "tree_feature_importance.csv", index=False
+    )
+    return summaries.to_dict("records"), (
+        shap_values[PREDICTIVE_SPECS["extended"]].to_numpy()
+        if shap_values is not None else None
+    ), (shap_values[PREDICTIVE_SPECS["extended"]] if shap_values is not None else None)
+
+
+def fit_predictive_models(
+    df: pd.DataFrame, output_dir: Path, test_start_year: int,
+    random_state: int, cv_splits: int, run_temporal: bool = False,
+) -> tuple[list[dict[str, Any]], np.ndarray | None, pd.DataFrame | None]:
+    """Run primary grouped CV; temporal validation is optional robustness analysis."""
+    sample = complete_case(df, PREDICTIVE_SPECS["extended"])
+    metrics, shap_values, shap_features = grouped_cross_validation(
+        sample, output_dir, random_state, cv_splits
+    )
+    if run_temporal:
+        metrics.extend(temporal_cross_validation(
+            sample, PREDICTIVE_SPECS["extended"], output_dir, random_state, test_start_year
+        ))
+    return metrics, shap_values, shap_features
+
+
 def main() -> None:
     args = parse_args()
     output_dir = ROOT / args.output_dir
@@ -596,7 +663,8 @@ def main() -> None:
     logistic_metrics = fit_logistic(df, output_dir)
     fit_support_hypotheses(df, output_dir)
     predictive_metrics, shap_values, shap_features = fit_predictive_models(
-        df, output_dir, args.test_start_year, args.random_state, args.cv_splits)
+        df, output_dir, args.test_start_year, args.random_state, args.cv_splits,
+        args.temporal_validation)
     metrics = pd.DataFrame(logistic_metrics + predictive_metrics)
     metrics.to_csv(output_dir / "model_metrics.csv", index=False)
     coefficients = pd.read_csv(output_dir / "logistic_coefficients.csv")
@@ -604,17 +672,24 @@ def main() -> None:
     (output_dir / "run_summary.json").write_text(json.dumps({
         "dataset": str(ROOT / args.dataset),
         "rows": int(len(df)),
-        "test_start_year": args.test_start_year,
+        "test_start_year": args.test_start_year if args.temporal_validation else None,
         "random_state": args.random_state,
         "cv_splits": args.cv_splits,
+        "primary_evaluation": "dyad-grouped stratified CV",
+        "grouping_variable": "dyad_id",
+        "predictive_specifications": list(PREDICTIVE_SPECS),
+        "predictive_algorithms": list(PREDICTIVE_MODELS),
+        "temporal_validation": bool(args.temporal_validation),
         "logistic_models": list(MODEL_FEATURES),
         "support_hypotheses": ["H2_support_type", "H3_support_configuration",
                                "minor_to_war_escalation"],
-        "predictive_features": MODEL_FEATURES["M4"],
+        "predictive_features": {
+            "baseline": PREDICTIVE_SPECS["baseline"],
+            "extended": PREDICTIVE_SPECS["extended"],
+        },
         "note": "Logistic models use cluster-robust standard errors by dyad. "
-                "Tree models use complete-case data, dyad-held-out stratified grouped "
-                "cross-validation, and repeated expanding-window temporal validation; "
-                "repeated seeds assess "
+                "Predictive models use complete-case data and dyad-held-out stratified "
+                "grouped cross-validation; temporal validation is optional. Repeated seeds assess "
                 "algorithmic sensitivity, not additional independent observations. "
                 "SHAP values describe prediction, not causal effects.",
     }, indent=2), encoding="utf-8")
