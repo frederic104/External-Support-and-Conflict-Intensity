@@ -403,7 +403,11 @@ def _fit_binary_specification(
     metric = {
         "model": model_name, "hypothesis": hypothesis,
         "status": "ok" if converged else "nonconverged",
-        "n": len(sample), "pseudo_r2": float(fit.prsquared), "aic": float(fit.aic),
+        "n": len(sample), "war_n": int(y.sum()), "minor_n": int((y == 0).sum()),
+        "unique_dyads": int(sample["dyad_id"].nunique()),
+        "unique_conflicts": int(sample["conflict_id"].nunique())
+        if "conflict_id" in sample else np.nan,
+        "pseudo_r2": float(fit.prsquared), "aic": float(fit.aic),
         "converged": converged,
         "warning": "",
         "inference_error": "",
@@ -429,15 +433,60 @@ def fit_support_hypotheses(df: pd.DataFrame, output_dir: Path) -> None:
         metric_rows.append(metric)
 
     valid_categories = ["none", "one_side_only", "both_sides"]
+    configuration_counts = df["support_configuration_confirmed"].value_counts()
     excluded = (~df["support_configuration_confirmed"].isin(valid_categories)).sum()
     config = df[df["support_configuration_confirmed"].isin(valid_categories)].copy()
     config["support_one_side"] = (config["support_configuration_confirmed"] == "one_side_only").astype(int)
     config["support_both_sides"] = (config["support_configuration_confirmed"] == "both_sides").astype(int)
+    descriptive_metrics = {
+        "h3_none_n": int(configuration_counts.get("none", 0)),
+        "h3_one_side_n": int(configuration_counts.get("one_side_only", 0)),
+        "h3_both_sides_n": int(configuration_counts.get("both_sides", 0)),
+        "h3_unknown_n": int(configuration_counts.get("unknown", 0)),
+        "h3_unresolved_side_n": int(configuration_counts.get("unresolved_side", 0)),
+    }
     rows, metric = _fit_binary_specification(
         config, baseline + ["support_one_side", "support_both_sides"],
         "war_t", "H3_support_configuration", "support_configuration",
-        {"h3_excluded_invalid_categories": int(excluded),
+        {**descriptive_metrics,
+         "h3_excluded_invalid_categories": int(excluded),
          "h3_reference_category": "none"},
+    )
+    coefficient_rows.extend(rows)
+    metric_rows.append(metric)
+    supported = df[df["support_configuration_confirmed"].isin(
+        ["one_side_only", "both_sides"]
+    )].copy()
+    supported["support_both_sides"] = (
+        supported["support_configuration_confirmed"] == "both_sides"
+    ).astype(int)
+    supported_metric = {
+        "h3_analysis": "exploratory_supported_dyads",
+        "h3_reference_category": "one_side_only",
+        "h3_supported_only": True,
+        "h3_supported_n": int(len(supported)),
+        "h3_supported_war_n": int(supported["war_t"].sum()),
+        "h3_supported_one_side_n": int(
+            (supported["support_configuration_confirmed"] == "one_side_only").sum()
+        ),
+        "h3_supported_both_sides_n": int(
+            (supported["support_configuration_confirmed"] == "both_sides").sum()
+        ),
+        "h3_excluded_none_n": int((df["support_configuration_confirmed"] == "none").sum()),
+        "h3_excluded_unresolved_n": int(
+            (~df["support_configuration_confirmed"].isin(
+                ["one_side_only", "both_sides", "none"]
+            )).sum()
+        ),
+        "h3_interpretation": (
+            "Among confirmed-support observations, both-sided versus one-sided "
+            "support; not support versus no support."
+        ),
+    }
+    rows, metric = _fit_binary_specification(
+        supported, baseline + ["support_both_sides"], "war_t",
+        "H3_supported_dyads", "support_configuration_supported",
+        supported_metric,
     )
     coefficient_rows.extend(rows)
     metric_rows.append(metric)
@@ -775,7 +824,7 @@ def main() -> None:
         "temporal_validation": bool(args.temporal_validation),
         "logistic_models": list(MODEL_FEATURES),
         "support_hypotheses": ["H2_support_type", "H3_support_configuration",
-                               "minor_to_war_escalation"],
+                               "H3_supported_dyads", "minor_to_war_escalation"],
         "predictive_features": {
             "baseline": PREDICTIVE_SPECS["baseline"],
             "extended": PREDICTIVE_SPECS["extended"],
