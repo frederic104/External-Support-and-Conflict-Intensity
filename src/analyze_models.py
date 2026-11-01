@@ -192,6 +192,63 @@ def save_plots(output_dir: Path, coefficients: pd.DataFrame,
         fig.savefig(output_dir / "support_mechanisms.png", bbox_inches="tight")
         plt.close(fig)
 
+    observed_path = output_dir / "h1_breadth_observed.csv"
+    prediction_path = output_dir / "h1_functional_form_predictions.csv"
+    loo_path = output_dir / "h1_leave_one_conflict_out.csv"
+    if observed_path.exists() and prediction_path.exists():
+        observed = pd.read_csv(observed_path)
+        predictions = pd.read_csv(prediction_path)
+        fig, ax = plt.subplots(figsize=(7, 4.5))
+        ax.scatter(
+            observed["n_support_types_confirmed"], observed["war_proportion"],
+            s=35, color="#e76f51", label="Observed war proportion",
+        )
+        for specification, part in predictions.groupby("specification"):
+            label = f"{specification.title()} adjusted probability"
+            style = "-" if specification == "quadratic" else "--"
+            ax.plot(
+                part["breadth"], part["predicted_probability"],
+                linewidth=2, linestyle=style, label=label,
+            )
+        ax.set_xlabel("Confirmed support breadth")
+        ax.set_ylabel("Probability / proportion of war")
+        ax.set_title("Observed and adjusted H1 breadth patterns")
+        ax.legend(frameon=False)
+        ax.grid(axis="y", alpha=0.2)
+        fig.tight_layout()
+        fig.savefig(output_dir / "h1_breadth_functional_form.pdf", bbox_inches="tight")
+        fig.savefig(output_dir / "h1_breadth_functional_form.png", bbox_inches="tight")
+        plt.close(fig)
+    if loo_path.exists():
+        loo = pd.read_csv(loo_path).dropna(
+            subset=["odds_ratio", "or_ci_lower", "or_ci_upper"]
+        )
+        loo = loo[
+            np.isfinite(loo[["odds_ratio", "or_ci_lower", "or_ci_upper"]]).all(axis=1)
+            & (loo["odds_ratio"] > 0)
+            & (loo["or_ci_lower"] > 0)
+            & (loo["or_ci_upper"] > 0)
+        ]
+        if not loo.empty:
+            fig, ax = plt.subplots(figsize=(8, 4.5))
+            ax.errorbar(
+                loo["excluded_conflict_id"].astype(str), loo["odds_ratio"],
+                yerr=[
+                    loo["odds_ratio"] - loo["or_ci_lower"],
+                    loo["or_ci_upper"] - loo["odds_ratio"],
+                ],
+                fmt="o", color="#1f4e79", capsize=3,
+            )
+            ax.axhline(1, color="#9ca3af", linestyle="--", linewidth=1)
+            ax.set_yscale("log")
+            ax.set_xlabel("Excluded conflict ID")
+            ax.set_ylabel("Breadth odds ratio (95% CI)")
+            ax.set_title("Leave-one-conflict-out H1 sensitivity")
+            fig.tight_layout()
+            fig.savefig(output_dir / "h1_conflict_sensitivity.pdf", bbox_inches="tight")
+            fig.savefig(output_dir / "h1_conflict_sensitivity.png", bbox_inches="tight")
+            plt.close(fig)
+
     if shap_values is not None and shap_features is not None and len(shap_features):
         shap.summary_plot(shap_values, shap_features, plot_type="dot", show=False,
                           max_display=min(10, shap_features.shape[1]))
@@ -353,7 +410,180 @@ def fit_logistic(df: pd.DataFrame, output_dir: Path) -> list[dict[str, Any]]:
             coefficients.extend(rows)
             metrics.append(metric)
     pd.DataFrame(coefficients).to_csv(output_dir / "logistic_coefficients.csv", index=False)
+    sensitivity_metrics = fit_h1_sensitivity(df, output_dir)
+    metrics.extend(sensitivity_metrics)
     return metrics
+
+
+def fit_h1_sensitivity(df: pd.DataFrame, output_dir: Path) -> list[dict[str, Any]]:
+    """Run exploratory functional-form and leave-one-conflict-out H1 checks."""
+    sample = complete_case(df, MODEL_FEATURES["M1"])
+    breadth = "n_support_types_confirmed"
+    sample = sample.copy()
+    mean_breadth = float(sample[breadth].mean())
+    sample["breadth_centered"] = sample[breadth] - mean_breadth
+    sample["breadth_centered_sq"] = sample["breadth_centered"] ** 2
+    quadratic_features = MODEL_FEATURES["M0"] + [
+        "breadth_centered", "breadth_centered_sq"
+    ]
+    rows, metric = _fit_binary_specification(
+        sample, quadratic_features, "war_t", "H1_quadratic",
+        "h1_functional_form",
+    )
+    for row in rows:
+        row["sample_specification"] = "primary_m1_common"
+    metric.update({
+        "method": "logistic_sensitivity",
+        "sample_specification": "primary_m1_common",
+        "breadth_mean": mean_breadth,
+        "breadth_centered_mean": float(sample["breadth_centered"].mean()),
+        "breadth_centered_sq_mean": float(sample["breadth_centered_sq"].mean()),
+        "joint_test": _quadratic_joint_test(sample, quadratic_features),
+        "sensitivity_role": "exploratory_functional_form",
+    })
+    pd.DataFrame(rows).to_csv(
+        output_dir / "h1_quadratic_coefficients.csv", index=False
+    )
+    pd.DataFrame([metric]).to_csv(
+        output_dir / "h1_quadratic_metrics.csv", index=False
+    )
+
+    conflict_summary = sample.groupby("conflict_id", dropna=False).agg(
+        n=("war_t", "size"),
+        unique_dyads=("dyad_id", "nunique"),
+        war_n=("war_t", "sum"),
+        mean_breadth=(breadth, "mean"),
+        median_breadth=(breadth, "median"),
+        max_breadth=(breadth, "max"),
+    ).reset_index()
+    conflict_summary.to_csv(
+        output_dir / "h1_conflict_summary.csv", index=False
+    )
+    observed = sample.groupby(breadth).agg(
+        n=("war_t", "size"), war_n=("war_t", "sum"),
+        war_proportion=("war_t", "mean"),
+    ).reset_index()
+    observed.to_csv(output_dir / "h1_breadth_observed.csv", index=False)
+    _write_h1_predictions(sample, output_dir, quadratic_features, mean_breadth)
+
+    loo_rows: list[dict[str, Any]] = []
+    for conflict_id in sample["conflict_id"].drop_duplicates():
+        loo = sample[sample["conflict_id"] != conflict_id].copy()
+        fit_rows, fit_metric = _fit_binary_specification(
+            loo, MODEL_FEATURES["M1"], "war_t", "H1_leave_one_conflict_out",
+            "h1_conflict_sensitivity",
+        )
+        target = next(
+            (row for row in fit_rows if row["term"] == breadth),
+            {"odds_ratio": np.nan, "or_ci_lower": np.nan,
+             "or_ci_upper": np.nan, "p_value": np.nan,
+             "converged": False, "inference_status": "non_estimable"},
+        )
+        loo_rows.append({
+            "excluded_conflict_id": conflict_id,
+            "n": len(loo),
+            "war_n": int(loo["war_t"].sum()),
+            "minor_n": int((loo["war_t"] == 0).sum()),
+            "unique_dyads": int(loo["dyad_id"].nunique()),
+            "unique_conflicts": int(loo["conflict_id"].nunique()),
+            "breadth_mean": float(loo[breadth].mean()),
+            "breadth_estimate": target.get("estimate", np.nan),
+            "odds_ratio": target.get("odds_ratio", np.nan),
+            "or_ci_lower": target.get("or_ci_lower", np.nan),
+            "or_ci_upper": target.get("or_ci_upper", np.nan),
+            "p_value": target.get("p_value", np.nan),
+            "converged": fit_metric.get("converged", False),
+            "status": fit_metric.get("status", "non_estimable"),
+            "inference_error": fit_metric.get("inference_error", ""),
+        })
+    loo_frame = pd.DataFrame(loo_rows)
+    loo_frame.to_csv(
+        output_dir / "h1_leave_one_conflict_out.csv", index=False
+    )
+    loo_summary = {
+        "model": "H1_leave_one_conflict_out",
+        "method": "logistic_sensitivity",
+        "status": "ok",
+        "sensitivity_role": "exploratory_conflict_sensitivity",
+        "attempted": len(loo_frame),
+        "valid": int((loo_frame["status"] == "ok").sum()),
+        "non_estimable": int((loo_frame["status"] != "ok").sum()),
+    }
+    return [metric, loo_summary]
+
+
+def _write_h1_predictions(
+    sample: pd.DataFrame, output_dir: Path, features: list[str], mean_breadth: float,
+) -> None:
+    breadth = "n_support_types_confirmed"
+    grid = np.linspace(
+        sample[breadth].min(), sample[breadth].max(), 100,
+    )
+    baseline_values = sample[MODEL_FEATURES["M0"]].median().to_dict()
+    rows: list[dict[str, Any]] = []
+    specifications = {
+        "linear": MODEL_FEATURES["M0"] + [breadth],
+        "quadratic": features,
+    }
+    for specification, specification_features in specifications.items():
+        try:
+            X = sm.add_constant(sample[specification_features], has_constant="add")
+            with warnings.catch_warnings(record=True) as captured:
+                warnings.simplefilter("always")
+                fit = sm.Logit(sample["war_t"].astype(int), X).fit(
+                    disp=False, maxiter=200, cov_type="cluster",
+                    cov_kwds={"groups": sample["dyad_id"]},
+                    warn_convergence=False,
+                )
+            estimable, _ = _inference_diagnostics(fit, captured)
+            if not estimable:
+                continue
+            for value in grid:
+                row = baseline_values.copy()
+                row[breadth] = value
+                row["breadth_centered"] = value - mean_breadth
+                row["breadth_centered_sq"] = row["breadth_centered"] ** 2
+                prediction = fit.predict(sm.add_constant(
+                    pd.DataFrame([row])[specification_features], has_constant="add"
+                ))
+                rows.append({
+                    "specification": specification,
+                    "breadth": value,
+                    "predicted_probability": float(prediction.iloc[0]),
+                })
+        except (ValueError, np.linalg.LinAlgError, FloatingPointError):
+            continue
+    pd.DataFrame(rows).to_csv(
+        output_dir / "h1_functional_form_predictions.csv", index=False
+    )
+
+
+def _quadratic_joint_test(sample: pd.DataFrame, features: list[str]) -> dict[str, Any]:
+    X = sm.add_constant(sample[features], has_constant="add")
+    y = sample["war_t"].astype(int)
+    try:
+        with warnings.catch_warnings(record=True) as captured:
+            warnings.simplefilter("always")
+            fit = sm.Logit(y, X).fit(
+                disp=False, maxiter=200, cov_type="cluster",
+                cov_kwds={"groups": sample["dyad_id"]},
+                warn_convergence=False,
+            )
+        estimable, reason = _inference_diagnostics(fit, captured)
+        if not estimable:
+            return {"status": "non_estimable", "p_value": np.nan, "error": reason}
+        restriction = np.zeros((2, len(fit.params)))
+        restriction[0, list(fit.params.index).index("breadth_centered")] = 1
+        restriction[1, list(fit.params.index).index("breadth_centered_sq")] = 1
+        test = fit.wald_test(restriction, scalar=True)
+        return {
+            "status": "ok",
+            "statistic": float(test.statistic),
+            "p_value": float(test.pvalue),
+            "error": "",
+        }
+    except (ValueError, np.linalg.LinAlgError, FloatingPointError) as exc:
+        return {"status": "non_estimable", "p_value": np.nan, "error": str(exc)}
 
 
 def _write_control_diagnostics(sample: pd.DataFrame, output_dir: Path) -> None:
