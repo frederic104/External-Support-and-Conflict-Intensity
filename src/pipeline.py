@@ -216,6 +216,7 @@ def validate_core_source_set(cfg: dict[str, Any], audit_dir: Path) -> None:
     files = cfg.get("files", {})
     versions = {key: str(value).strip() for key, value in cfg.get("ucdp_versions", {}).items()
                 if value is not None and str(value).strip()}
+    expected_version = str(cfg.get("project", {}).get("ucdp_version", "")).strip()
     required = ["dyadic", "esd_ty", "esd_dy"]
     records: list[dict[str, Any]] = []
     missing: list[str] = []
@@ -228,6 +229,7 @@ def validate_core_source_set(cfg: dict[str, Any], audit_dir: Path) -> None:
             "configured_path": str(path) if path else None,
             "exists": exists,
             "declared_version": versions.get(role),
+            "expected_version": expected_version or None,
         })
         if not exists:
             missing.append(role)
@@ -247,8 +249,11 @@ def validate_core_source_set(cfg: dict[str, Any], audit_dir: Path) -> None:
             "See reports/data_audit/core_source_preflight.csv."
         )
 
-    core_versions = {versions.get(role) for role in required}
-    if None in core_versions or len(core_versions) != 1:
+    mismatched = [
+        role for role in required
+        if not expected_version or versions.get(role) != expected_version
+    ]
+    if mismatched:
         translation = cfg.get("ucdp_versions", {}).get("id_translation")
         translation_path = ROOT / translation if translation else None
         shown = ", ".join(f"{role}={versions.get(role, 'undeclared')}" for role in required)
@@ -259,7 +264,8 @@ def validate_core_source_set(cfg: dict[str, Any], audit_dir: Path) -> None:
             ""
         )
         raise ValueError(
-            "UCDP core files do not share one declared ID release (" + shown + "). "
+            "UCDP core files must use project.ucdp_version="
+            f"{expected_version or 'undeclared'} (" + shown + "). "
             "Do not merge dyad_id values across releases. Replace the files with a same-version set, "
             "or implement and validate an official ID translation before enabling a cross-version run." +
             translation_note + " See reports/data_audit/core_source_preflight.csv."
@@ -269,12 +275,15 @@ def validate_core_source_set(cfg: dict[str, Any], audit_dir: Path) -> None:
 def dyadic_schema(raw: pd.DataFrame) -> pd.DataFrame:
     wanted = {"dyad_id", "year", "intensity", "conflict_type", "country_a", "country_b",
               "location", "start_date", "gwno_a", "gwno_b", "side_a_id", "side_b_id", "conflict_id"}
-    required = {"dyad_id", "year", "intensity", "conflict_type", "country_a", "side_a_id", "side_b_id"}
+    required = {"dyad_id", "year", "intensity", "conflict_type", "country_a", "side_a_id",
+                "side_b_id", "conflict_id"}
     out = standardize_columns(raw, wanted, "UCDP Dyadic v18.1", required)
     out = clean_key_columns(out)
     for c in ["intensity", "conflict_type", "gwno_a", "gwno_b", "conflict_id"]:
         if c in out:
             out[c] = _clean_number(out[c])
+    if out["conflict_id"].isna().any():
+        raise ValueError("UCDP Dyadic v18.1 conflict_id is missing for one or more rows.")
     out["side_a_id"] = out["side_a_id"].map(_clean_id).astype("string")
     out["side_b_id"] = out["side_b_id"].map(_clean_id).astype("string")
     out["country_a"] = out["country_a"].astype("string").replace({"<NA>": pd.NA, "-99": pd.NA, "-999": pd.NA})
@@ -335,7 +344,8 @@ def get_dyadic_region(dy: pd.DataFrame, cfg: dict[str, Any], audit_dir: Path) ->
 def build_consecutive_panel(dy: pd.DataFrame, cfg: dict[str, Any], audit_dir: Path) -> pd.DataFrame:
     p = cfg["project"]
     keys = ["dyad_id", "year", "intensity", "conflict_type", "country_a", "country_b", "location",
-            "gwno_a", "side_a_id", "side_b_id", "episode_age_years", "active_episode_number"]
+            "gwno_a", "side_a_id", "side_b_id", "conflict_id", "episode_age_years",
+            "active_episode_number"]
     keys = [c for c in keys if c in dy.columns]
     current = dy[keys].copy()
     current = current[(current["year"] >= int(p["outcome_year_start"])) &
@@ -567,7 +577,9 @@ def build_esd_features(esd_ty: pd.DataFrame, esd_dy: pd.DataFrame, dy_all: pd.Da
 
     # Reindex with ESD DY as the complete dyad-year universe, then apply documented zero rules.
     features = dy_support.merge(features, on=["dyad_id", "year"], how="left", validate="one_to_one")
-    features["any_support_recorded"] = pd.to_numeric(features["any_support_ty"], errors="coerce")
+    features["any_support_recorded"] = (
+        pd.to_numeric(features["any_support_ty"], errors="coerce").fillna(0)
+    )
     no_support = features["any_support_all"].eq(0)
     has_support = features["any_support_all"].eq(1)
     no_recorded_support = no_support & features["any_support_recorded"].ne(1)

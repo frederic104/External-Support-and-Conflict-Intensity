@@ -53,10 +53,8 @@ files:
   interim_dir: "data/interim"
   audit_dir: "reports/data_audit"
 
-# Core UCDP identifiers must refer to the same release.  The current raw
-# directory has ESD 18.1 but Dyadic 26.1, so preflight stops before any join.
-# Set these only after placing a same-version source set (or an official,
-# validated ID translation table) in data/raw.
+# Core UCDP identifiers are fixed to the project release. Preflight stops
+# before any join if a configured declaration differs from project.ucdp_version.
 ucdp_versions:
   dyadic: "18.1"
   esd_ty: "18.1"

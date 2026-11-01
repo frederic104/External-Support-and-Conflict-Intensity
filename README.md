@@ -12,13 +12,10 @@ The central rule is: **do not convert an unexplained blank, missing row, unmatch
    pip install -r requirements.txt
    ```
 
-2. Use one version-aligned official set of **UCDP Dyadic**, **ESD TY**, and
-   **ESD DY** files. The core `dyad_id` is release-specific. The configuration
-   records the raw files currently found in this project, but the preflight
-   gate will stop if their declared versions differ or if a core file is absent.
-   For the original 1976–2017 design, download the v18.1 trio and update all
-   three `files` paths plus all three `ucdp_versions` entries in
-   `config/policy.yaml` together. A consistent naming convention is:
+2. Use the fixed, version-aligned **UCDP v18.1** set of Dyadic, ESD TY, and
+   ESD DY files. The core `dyad_id` is release-specific and the preflight gate
+   rejects any source declaration that differs from `project.ucdp_version`.
+   The configured paths are:
 
    ```text
    data/raw/ucdp/ucdp_dyadic_181.csv
@@ -26,9 +23,9 @@ The central rule is: **do not convert an unexplained blank, missing row, unmatch
    data/raw/ucdp/ucdp_esd_dy_181.csv
    ```
 
-   Alternatively, use a fully version-aligned current-release set and revise
-   `ucdp_versions` and the paths in `config/policy.yaml` together. Do not
-   substitute ESD TY for ESD DY: DY is the authority for the explicit
+   Raw source files are not distributed in this GitHub repository; download
+   the official v18.1 files locally and place them at the configured paths.
+   Do not substitute ESD TY for ESD DY: DY is the authority for the explicit
    support/no-support status.
 
 3. Review `config/policy.yaml`. In particular, verify the region allow-list and exact country aliases. The default region filter is an initial study choice, not a verified geopolitical crosswalk.
@@ -55,18 +52,15 @@ Tests use tiny synthetic examples; they do not establish that a user's downloade
 
 ## Current raw-data preflight
 
-The present raw directory contains `ucdp-esd-ty-181.csv` (ESD TY v18.1),
-`Dyadic_v26_1.csv` (Dyadic v26.1), and `BattleDeaths_v26_1_conf.csv`
-(conflict-level BRD v26.1). It does not contain the required ESD DY file.
-`python src/pipeline.py` therefore writes
-`reports/data_audit/core_source_preflight.csv` and stops before it can make an
-invalid cross-release join. The conflict-level BRD file is intentionally not
-used; obtain the dyadic BRD file matching the selected Dyadic release for the
-robustness outcome.
+The configured raw paths are checked before integration. If a core file is
+absent, or if any declared release differs from v18.1, `python src/pipeline.py`
+writes `reports/data_audit/core_source_preflight.csv` and stops before it can
+make an invalid cross-release join. Raw UCDP files are intentionally omitted
+from GitHub and must be supplied locally.
 
 ## Version and unit lock
 
-The main analysis locks **UCDP Dyadic v18.1 + UCDP ESD v18.1** because ESD v18.1 uses the Dyadic v18.1 `dyad_id` system. The final panel key is `(dyad_id, outcome_year)`. The outcome is observed in year `t`; external-support features and country-year controls are drawn from the exact year `t-1`.
+The main analysis fixes **UCDP Dyadic v18.1 + UCDP ESD v18.1** because ESD v18.1 uses the Dyadic v18.1 `dyad_id` system. The final panel retains current `conflict_id` and lagged `lag_conflict_id` alongside the `(dyad_id, outcome_year)` key. The outcome is observed in year `t`; external-support features and country-year controls are drawn from the exact year `t-1`.
 
 Do **not** merge ESD v18.1 straight into current Dyadic v26.1 based only on IDs. UCDP changed identifiers across releases. If newer data are used, apply official ID translation files and report the translation coverage and unresolved keys separately.
 
