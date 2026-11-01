@@ -60,6 +60,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--random-state", type=int, default=42)
     parser.add_argument("--cv-splits", type=int, default=5)
     parser.add_argument(
+        "--cv-split-seeds", type=int, nargs="+", default=None,
+        help="Random states for repeated grouped-CV split sensitivity checks.",
+    )
+    parser.add_argument(
         "--temporal-validation", action="store_true",
         help="Run forward-looking temporal validation as a supplementary analysis.",
     )
@@ -692,125 +696,260 @@ def _predictive_estimator(model_name: str, seed: int) -> Any:
 
 def grouped_cross_validation(
     sample: pd.DataFrame, output_dir: Path, random_state: int, n_splits: int,
+    split_seeds: list[int] | None = None,
 ) -> tuple[list[dict[str, Any]], np.ndarray | None, pd.DataFrame | None]:
-    """Compare baseline and extended specifications on identical dyad-held-out folds."""
+    """Compare specifications on repeated, identical dyad-held-out folds."""
     if n_splits < 2 or sample["dyad_id"].nunique() < n_splits:
         raise ValueError("Grouped CV requires at least as many dyads as folds.")
-    splitter = StratifiedGroupKFold(
-        n_splits=n_splits, shuffle=True, random_state=random_state
-    )
+    split_seeds = split_seeds or [
+        random_state, random_state + 1009, random_state + 2017
+    ]
     y = sample["war_t"].astype(int)
     groups = sample["dyad_id"]
     folds: list[dict[str, Any]] = []
+    prediction_rows: list[dict[str, Any]] = []
+    overlap_rows: list[dict[str, Any]] = []
     shap_rows: list[pd.DataFrame] = []
     importance_rows: list[dict[str, Any]] = []
-    seed_values = [random_state, random_state + 101, random_state + 202]
-    for fold_id, (train_idx, test_idx) in enumerate(
-        splitter.split(sample[PREDICTIVE_SPECS["extended"]], y, groups), start=1
-    ):
-        train, test = sample.iloc[train_idx], sample.iloc[test_idx]
-        if set(train["dyad_id"]) & set(test["dyad_id"]):
-            raise RuntimeError(f"Dyad leakage detected in fold {fold_id}.")
-        for spec_name, features in PREDICTIVE_SPECS.items():
-            for model_name in PREDICTIVE_MODELS:
-                seed_results: list[dict[str, Any]] = []
-                for repetition, seed in enumerate(seed_values, start=1):
-                    if train["war_t"].nunique() < 2:
-                        seed_results.append({
-                            "fold": fold_id, "specification": spec_name,
-                            "model": model_name, "repetition": repetition,
+    estimator_seeds = [
+        random_state + 100_003,
+        random_state + 100_104,
+        random_state + 100_205,
+    ]
+    for split_repetition, split_seed in enumerate(split_seeds, start=1):
+        splitter = StratifiedGroupKFold(
+            n_splits=n_splits, shuffle=True, random_state=split_seed
+        )
+        for fold_id, (train_idx, test_idx) in enumerate(
+            splitter.split(sample[PREDICTIVE_SPECS["extended"]], y, groups), start=1
+        ):
+            train, test = sample.iloc[train_idx], sample.iloc[test_idx]
+            train_dyads, test_dyads = set(train["dyad_id"]), set(test["dyad_id"])
+            if train_dyads & test_dyads:
+                raise RuntimeError(
+                    f"Dyad leakage detected in split {split_repetition}, fold {fold_id}."
+                )
+            train_conflicts = set(train["conflict_id"])
+            test_conflicts = set(test["conflict_id"])
+            shared_conflicts = train_conflicts & test_conflicts
+            overlap_rows.append({
+                "split_repetition": split_repetition,
+                "split_seed": split_seed,
+                "fold": fold_id,
+                "train_conflicts": len(train_conflicts),
+                "test_conflicts": len(test_conflicts),
+                "shared_conflicts": len(shared_conflicts),
+                "shared_conflict_ids": "|".join(
+                    str(value) for value in sorted(shared_conflicts, key=str)
+                ),
+            })
+            for spec_name, features in PREDICTIVE_SPECS.items():
+                for model_name in PREDICTIVE_MODELS:
+                    for estimator_repetition, seed in enumerate(
+                        estimator_seeds, start=1
+                    ):
+                        base = {
+                            "split_repetition": split_repetition,
+                            "split_seed": split_seed,
+                            "fold": fold_id,
+                            "specification": spec_name,
+                            "model": model_name,
+                            "repetition": estimator_repetition,
                             "status": "not_estimable",
-                        })
-                        continue
-                    estimator = _predictive_estimator(model_name, seed)
-                    estimator.fit(train[features], train["war_t"].astype(int))
-                    probability = estimator.predict_proba(test[features])[:, 1]
-                    result = binary_metrics(test["war_t"].astype(int), probability)
-                    seed_results.append({
-                        "fold": fold_id, "specification": spec_name,
-                        "model": model_name, "repetition": repetition,
-                        "status": "ok", "train_n": len(train), "test_n": len(test),
-                        "train_dyads": train["dyad_id"].nunique(),
-                        "test_dyads": test["dyad_id"].nunique(),
-                        "train_n_war": int(train["war_t"].sum()),
-                        "train_n_minor": int((train["war_t"] == 0).sum()),
-                        "test_n_war": int(test["war_t"].sum()),
-                        "test_n_minor": int((test["war_t"] == 0).sum()),
-                        "test_war_prevalence": float(test["war_t"].mean()),
-                        **{key: value for key, value in result.items()
-                           if key not in {"n", "n_war", "n_minor", "war_prevalence"}},
-                    })
-                    if spec_name == "extended" and model_name == "xgboost" and repetition == 1:
-                        values = shap.TreeExplainer(estimator).shap_values(test[features])
-                        if isinstance(values, list):
-                            values = values[-1]
-                        frame = pd.DataFrame(values, columns=features)
-                        frame.insert(0, "fold", fold_id)
-                        frame.insert(1, "dyad_id", test["dyad_id"].to_numpy())
-                        if "year" not in frame.columns:
-                            frame.insert(2, "year", test["year"].to_numpy())
-                        else:
-                            frame.insert(2, "observation_year", test["year"].to_numpy())
-                        shap_rows.append(frame)
-                    if hasattr(estimator, "feature_importances_"):
-                        importance_rows.extend(
-                            {"fold": fold_id, "specification": spec_name,
-                             "model": model_name, "feature": feature,
-                             "importance": float(value)}
-                            for feature, value in zip(features, estimator.feature_importances_)
-                        )
-                folds.extend(seed_results)
+                            "train_n": len(train),
+                            "test_n": len(test),
+                            "train_dyads": len(train_dyads),
+                            "test_dyads": len(test_dyads),
+                            "train_n_war": int(train["war_t"].sum()),
+                            "train_n_minor": int((train["war_t"] == 0).sum()),
+                            "test_n_war": int(test["war_t"].sum()),
+                            "test_n_minor": int((test["war_t"] == 0).sum()),
+                            "test_war_prevalence": float(test["war_t"].mean()),
+                        }
+                        try:
+                            if train["war_t"].nunique() < 2:
+                                folds.append(base)
+                                continue
+                            estimator = _predictive_estimator(model_name, seed)
+                            estimator.fit(train[features], train["war_t"].astype(int))
+                            probability = estimator.predict_proba(test[features])[:, 1]
+                            result = binary_metrics(test["war_t"].astype(int), probability)
+                            base.update({
+                                "status": "ok",
+                                **{key: value for key, value in result.items()
+                                   if key not in {"n", "n_war", "n_minor",
+                                                  "war_prevalence"}},
+                            })
+                            for row_id, actual, predicted in zip(
+                                test.index, test["war_t"], probability
+                            ):
+                                prediction_rows.append({
+                                    "split_repetition": split_repetition,
+                                    "split_seed": split_seed,
+                                    "fold": fold_id,
+                                    "specification": spec_name,
+                                    "model": model_name,
+                                    "repetition": estimator_repetition,
+                                    "row_index": row_id,
+                                    "dyad_id": test.loc[row_id, "dyad_id"],
+                                    "conflict_id": test.loc[row_id, "conflict_id"],
+                                    "year": test.loc[row_id, "year"],
+                                    "war_t": int(actual),
+                                    "predicted_probability": float(predicted),
+                                })
+                            if (
+                                split_repetition == 1
+                                and spec_name == "extended"
+                                and model_name == "xgboost"
+                                and estimator_repetition == 1
+                            ):
+                                values = shap.TreeExplainer(estimator).shap_values(
+                                    test[features]
+                                )
+                                if isinstance(values, list):
+                                    values = values[-1]
+                                frame = pd.DataFrame(values, columns=features)
+                                frame.insert(0, "fold", fold_id)
+                                frame.insert(1, "dyad_id", test["dyad_id"].to_numpy())
+                                if "year" not in frame.columns:
+                                    frame.insert(2, "year", test["year"].to_numpy())
+                                else:
+                                    frame.insert(2, "observation_year", test["year"].to_numpy())
+                                shap_rows.append(frame)
+                            if hasattr(estimator, "feature_importances_"):
+                                importance_rows.extend(
+                                    {"split_repetition": split_repetition,
+                                     "split_seed": split_seed, "fold": fold_id,
+                                     "specification": spec_name, "model": model_name,
+                                     "feature": feature, "importance": float(value)}
+                                    for feature, value in zip(
+                                        features, estimator.feature_importances_
+                                    )
+                                )
+                        except (ValueError, np.linalg.LinAlgError, FloatingPointError) as exc:
+                            base["error"] = str(exc)
+                        folds.append(base)
     seed_frame = pd.DataFrame(folds)
     seed_frame.to_csv(output_dir / "grouped_cv_seed_metrics.csv", index=False)
+    pd.DataFrame(prediction_rows).to_csv(
+        output_dir / "grouped_cv_predictions.csv", index=False
+    )
+    pd.DataFrame(overlap_rows).to_csv(
+        output_dir / "grouped_cv_conflict_overlap.csv", index=False
+    )
     if seed_frame.empty:
         return [], None, None
-    fold_frame = (
-        seed_frame[seed_frame["status"].eq("ok")]
-        .groupby(["fold", "specification", "model"], as_index=False)
-        .agg(
-            train_n=("train_n", "first"), test_n=("test_n", "first"),
-            train_dyads=("train_dyads", "first"), test_dyads=("test_dyads", "first"),
-            train_n_war=("train_n_war", "first"), train_n_minor=("train_n_minor", "first"),
-            test_n_war=("test_n_war", "first"), test_n_minor=("test_n_minor", "first"),
-            test_war_prevalence=("test_war_prevalence", "first"),
-            roc_auc=("roc_auc", "mean"), average_precision=("average_precision", "mean"),
-            brier=("brier", "mean"), accuracy=("accuracy", "mean"),
-        )
+    group_keys = ["split_repetition", "split_seed", "fold", "specification", "model"]
+    fold_frame = seed_frame.groupby(group_keys, as_index=False).agg(
+        train_n=("train_n", "first"), test_n=("test_n", "first"),
+        train_dyads=("train_dyads", "first"), test_dyads=("test_dyads", "first"),
+        train_n_war=("train_n_war", "first"), train_n_minor=("train_n_minor", "first"),
+        test_n_war=("test_n_war", "first"), test_n_minor=("test_n_minor", "first"),
+        test_war_prevalence=("test_war_prevalence", "first"),
+        valid_estimator_seeds=("status", lambda values: int((values == "ok").sum())),
+        roc_auc=("roc_auc", "mean"), average_precision=("average_precision", "mean"),
+        brier=("brier", "mean"), accuracy=("accuracy", "mean"),
+    )
+    fold_frame["status"] = np.where(
+        fold_frame["valid_estimator_seeds"] == len(estimator_seeds),
+        "ok",
+        np.where(fold_frame["valid_estimator_seeds"] > 0, "partial", "not_estimable"),
     )
     fold_frame.to_csv(output_dir / "grouped_cv_fold_metrics.csv", index=False)
-    summaries = fold_frame.groupby(["specification", "model"]).agg(
-        folds=("fold", "nunique"), train_n_mean=("train_n", "mean"),
-        test_n_mean=("test_n", "mean"), test_dyads_mean=("test_dyads", "mean"),
+    repetition_frame = fold_frame.groupby(
+        ["split_repetition", "split_seed", "specification", "model"], as_index=False
+    ).agg(
+        folds=("fold", "nunique"), valid_folds=("status", lambda values: int((values != "not_estimable").sum())),
+        train_n_mean=("train_n", "mean"), test_n_mean=("test_n", "mean"),
+        test_dyads_mean=("test_dyads", "mean"),
         roc_auc_mean=("roc_auc", "mean"), roc_auc_sd=("roc_auc", "std"),
         average_precision_mean=("average_precision", "mean"),
         average_precision_sd=("average_precision", "std"),
         brier_mean=("brier", "mean"), brier_sd=("brier", "std"),
         accuracy_mean=("accuracy", "mean"), accuracy_sd=("accuracy", "std"),
     ).reset_index()
-    summaries.insert(1, "method", "predictive_group_cv")
-    summaries["status"] = "ok"
-    pivot = fold_frame.pivot_table(
-        index="fold", columns=["specification", "model"],
-        values=["average_precision", "brier"], aggfunc="first",
+    repetition_frame.insert(2, "method", "predictive_group_cv_repetition")
+    repetition_frame["status"] = np.where(
+        repetition_frame["valid_folds"] == n_splits, "ok", "partial"
+    )
+    repetition_frame.to_csv(
+        output_dir / "grouped_cv_repetition_metrics.csv", index=False
+    )
+    pivot = repetition_frame.pivot_table(
+        index=["split_repetition", "split_seed"], columns=["specification", "model"],
+        values=["average_precision_mean", "brier_mean"], aggfunc="first",
     )
     for model_name in PREDICTIVE_MODELS:
-        if ("average_precision", "baseline", model_name) in pivot and (
-            "average_precision", "extended", model_name
-        ) in pivot:
+        extended_key = ("average_precision_mean", "extended", model_name)
+        baseline_key = ("average_precision_mean", "baseline", model_name)
+        extended_brier_key = ("brier_mean", "extended", model_name)
+        baseline_brier_key = ("brier_mean", "baseline", model_name)
+        if extended_key in pivot and baseline_key in pivot:
+            repetition_frame.loc[
+                (repetition_frame["specification"] == "extended")
+                & (repetition_frame["model"] == model_name),
+                "delta_ap_vs_baseline",
+            ] = (
+                repetition_frame.loc[
+                    (repetition_frame["specification"] == "extended")
+                    & (repetition_frame["model"] == model_name),
+                    ["split_repetition", "split_seed"],
+                ].set_index(["split_repetition", "split_seed"]).index.map(
+                    (pivot[extended_key] - pivot[baseline_key]).to_dict()
+                )
+            )
+            repetition_frame.loc[
+                (repetition_frame["specification"] == "extended")
+                & (repetition_frame["model"] == model_name),
+                "delta_brier_vs_baseline",
+            ] = (
+                repetition_frame.loc[
+                    (repetition_frame["specification"] == "extended")
+                    & (repetition_frame["model"] == model_name),
+                    ["split_repetition", "split_seed"],
+                ].set_index(["split_repetition", "split_seed"]).index.map(
+                    (pivot[extended_brier_key] - pivot[baseline_brier_key]).to_dict()
+                )
+            )
+    summaries = repetition_frame.groupby(["specification", "model"]).agg(
+        split_repetitions=("split_repetition", "nunique"),
+        folds_per_repetition=("folds", "first"),
+        train_n_mean=("train_n_mean", "mean"),
+        test_n_mean=("test_n_mean", "mean"),
+        test_dyads_mean=("test_dyads_mean", "mean"),
+        roc_auc_mean=("roc_auc_mean", "mean"),
+        roc_auc_sd_across_repetitions=("roc_auc_mean", "std"),
+        average_precision_mean=("average_precision_mean", "mean"),
+        average_precision_sd_across_repetitions=("average_precision_mean", "std"),
+        brier_mean=("brier_mean", "mean"),
+        brier_sd_across_repetitions=("brier_mean", "std"),
+        accuracy_mean=("accuracy_mean", "mean"),
+        accuracy_sd_across_repetitions=("accuracy_mean", "std"),
+    ).reset_index()
+    summaries.insert(1, "method", "predictive_group_cv")
+    summaries["status"] = "ok"
+    for model_name in PREDICTIVE_MODELS:
+        deltas = repetition_frame[
+            (repetition_frame["specification"] == "extended")
+            & (repetition_frame["model"] == model_name)
+        ]
+        if not deltas.empty:
             summaries.loc[
                 (summaries["model"] == model_name) & (summaries["specification"] == "extended"),
                 "delta_ap_vs_baseline",
-            ] = float(
-                pivot[("average_precision", "extended", model_name)].mean()
-                - pivot[("average_precision", "baseline", model_name)].mean()
-            )
+            ] = deltas["delta_ap_vs_baseline"].mean()
             summaries.loc[
                 (summaries["model"] == model_name) & (summaries["specification"] == "extended"),
                 "delta_brier_vs_baseline",
-            ] = float(
-                pivot[("brier", "extended", model_name)].mean()
-                - pivot[("brier", "baseline", model_name)].mean()
-            )
+            ] = deltas["delta_brier_vs_baseline"].mean()
+            summaries.loc[
+                (summaries["model"] == model_name) & (summaries["specification"] == "extended"),
+                "delta_ap_sd_across_repetitions",
+            ] = deltas["delta_ap_vs_baseline"].std()
+            summaries.loc[
+                (summaries["model"] == model_name) & (summaries["specification"] == "extended"),
+                "delta_brier_sd_across_repetitions",
+            ] = deltas["delta_brier_vs_baseline"].std()
     shap_values = pd.concat(shap_rows, ignore_index=True) if shap_rows else None
     if shap_values is not None:
         shap_features = shap_values[PREDICTIVE_SPECS["extended"]]
@@ -834,11 +973,12 @@ def grouped_cross_validation(
 def fit_predictive_models(
     df: pd.DataFrame, output_dir: Path, test_start_year: int,
     random_state: int, cv_splits: int, run_temporal: bool = False,
+    split_seeds: list[int] | None = None,
 ) -> tuple[list[dict[str, Any]], np.ndarray | None, pd.DataFrame | None]:
     """Run primary grouped CV; temporal validation is optional robustness analysis."""
     sample = complete_case(df, PREDICTIVE_SPECS["extended"])
     metrics, shap_values, shap_features = grouped_cross_validation(
-        sample, output_dir, random_state, cv_splits
+        sample, output_dir, random_state, cv_splits, split_seeds
     )
     if run_temporal:
         metrics.extend(temporal_cross_validation(
@@ -856,7 +996,7 @@ def main() -> None:
     fit_support_hypotheses(df, output_dir)
     predictive_metrics, shap_values, shap_features = fit_predictive_models(
         df, output_dir, args.test_start_year, args.random_state, args.cv_splits,
-        args.temporal_validation)
+        args.temporal_validation, args.cv_split_seeds)
     metrics = pd.DataFrame(logistic_metrics + predictive_metrics)
     metrics.to_csv(output_dir / "model_metrics.csv", index=False)
     coefficients = pd.read_csv(output_dir / "logistic_coefficients.csv")
@@ -867,6 +1007,9 @@ def main() -> None:
         "test_start_year": args.test_start_year if args.temporal_validation else None,
         "random_state": args.random_state,
         "cv_splits": args.cv_splits,
+        "cv_split_seeds": args.cv_split_seeds or [
+            args.random_state, args.random_state + 1009, args.random_state + 2017
+        ],
         "primary_evaluation": "dyad-grouped stratified CV",
         "grouping_variable": "dyad_id",
         "predictive_specifications": list(PREDICTIVE_SPECS),
@@ -879,10 +1022,19 @@ def main() -> None:
             "baseline": PREDICTIVE_SPECS["baseline"],
             "extended": PREDICTIVE_SPECS["extended"],
         },
+        "cv_outputs": {
+            "seed_metrics": "grouped_cv_seed_metrics.csv",
+            "fold_metrics": "grouped_cv_fold_metrics.csv",
+            "repetition_metrics": "grouped_cv_repetition_metrics.csv",
+            "predictions": "grouped_cv_predictions.csv",
+            "conflict_overlap": "grouped_cv_conflict_overlap.csv",
+        },
         "note": "Logistic models use cluster-robust standard errors by dyad. "
                 "Predictive models use complete-case data and dyad-held-out stratified "
-                "grouped cross-validation; temporal validation is optional. Repeated seeds assess "
-                "algorithmic sensitivity, not additional independent observations. "
+                "grouped cross-validation; temporal validation is optional. Repeated estimator "
+                "seeds assess algorithmic sensitivity, not additional independent observations. "
+                "Split-seed repetitions are summarized hierarchically and are not additional "
+                "observations. Conflict overlap between train and test is reported diagnostically. "
                 "SHAP values describe prediction, not causal effects.",
     }, indent=2), encoding="utf-8")
     print(metrics.to_string(index=False))

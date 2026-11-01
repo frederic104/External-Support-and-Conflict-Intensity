@@ -335,7 +335,8 @@ class TestAnalysisPolicy(unittest.TestCase):
                 side_effect=AssertionError("temporal validation must be optional"),
             ):
                 metrics, _, _ = analyze_models.fit_predictive_models(
-                    sample, output_dir, test_start_year=2090, random_state=7, cv_splits=3
+                    sample, output_dir, test_start_year=2090, random_state=7,
+                    cv_splits=3, split_seeds=[7]
                 )
             seed = pd.read_csv(output_dir / "grouped_cv_seed_metrics.csv")
             folds = pd.read_csv(output_dir / "grouped_cv_fold_metrics.csv")
@@ -352,3 +353,60 @@ class TestAnalysisPolicy(unittest.TestCase):
                 ])
                 self.assertEqual(baseline_folds, extended_folds)
             self.assertTrue(metrics)
+
+    def test_repeated_grouped_cv_records_reproducible_split_and_conflict_diagnostics(self):
+        sample = make_analysis_sample(60)
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp)
+            analyze_models.fit_predictive_models(
+                sample, output_dir, test_start_year=2090, random_state=7,
+                cv_splits=3, split_seeds=[7, 17],
+            )
+            seed = pd.read_csv(output_dir / "grouped_cv_seed_metrics.csv")
+            folds = pd.read_csv(output_dir / "grouped_cv_fold_metrics.csv")
+            repetitions = pd.read_csv(
+                output_dir / "grouped_cv_repetition_metrics.csv"
+            )
+            overlap = pd.read_csv(
+                output_dir / "grouped_cv_conflict_overlap.csv"
+            )
+            predictions = pd.read_csv(output_dir / "grouped_cv_predictions.csv")
+
+        self.assertEqual(set(seed["split_seed"]), {7, 17})
+        self.assertEqual(set(repetitions["split_seed"]), {7, 17})
+        self.assertEqual(len(overlap), 2 * 3)
+        self.assertTrue((overlap["shared_conflicts"] >= 0).all())
+        self.assertTrue(
+            (folds["valid_estimator_seeds"] == len([7, 108, 209])).all()
+        )
+        self.assertEqual(
+            len(folds),
+            2 * 3 * 2 * len(analyze_models.PREDICTIVE_MODELS),
+        )
+        self.assertEqual(
+            len(repetitions),
+            2 * 2 * len(analyze_models.PREDICTIVE_MODELS),
+        )
+        self.assertTrue(
+            {"split_repetition", "split_seed", "fold", "predicted_probability"}
+            <= set(predictions)
+        )
+        for split_seed in [7, 17]:
+            split = folds[folds["split_seed"] == split_seed]
+            for fold_id in split["fold"].unique():
+                fold = split[split["fold"] == fold_id]
+                self.assertEqual(
+                    set(fold["specification"]), {"baseline", "extended"}
+                )
+
+    def test_grouped_cv_split_assignments_are_reproducible(self):
+        sample = make_analysis_sample(60)
+        outputs = []
+        with tempfile.TemporaryDirectory() as first, tempfile.TemporaryDirectory() as second:
+            for directory in (first, second):
+                analyze_models.grouped_cross_validation(
+                    sample, Path(directory), random_state=7, n_splits=3,
+                    split_seeds=[11, 23],
+                )
+                outputs.append(pd.read_csv(Path(directory) / "grouped_cv_conflict_overlap.csv"))
+        pd.testing.assert_frame_equal(outputs[0], outputs[1])
