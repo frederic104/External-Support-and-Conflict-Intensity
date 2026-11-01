@@ -148,6 +148,17 @@ The script fits M0–M4 Logistic Regression models with dyad-clustered standard 
 The tree models are predictive supplements, not causal estimators. Missing rows are excluded per model's complete-case sample; no outcome or control value is imputed by this script.
 
 The analysis also writes publication-style PDF and PNG figures: logistic odds-ratio forest plots, grouped-CV performance comparisons, descriptive support-mechanism panels, and an XGBoost SHAP beeswarm. The primary predictive validation is five-fold `StratifiedGroupKFold` on the M1 complete-case sample, holding out complete dyads so observations from the same dyad never appear in both train and test. Baseline (M0) and extended (M1) specifications use identical folds; Average Precision is primary, with Brier score and ROC-AUC as secondary metrics. Each fold uses three estimator seeds, averaging seeds within each fold before calculating fold-level means and standard deviations; repeated seeds assess algorithmic sensitivity and do not create additional observations. Fold and seed results are saved separately in `grouped_cv_fold_metrics.csv` and `grouped_cv_seed_metrics.csv`. Forward-looking temporal validation is optional via `--temporal-validation` and is a robustness analysis, not a prerequisite for grouped CV. The tree and SHAP importance CSV files remain available for numerical reporting, but the figures emphasize interpretable outcome relationships rather than treating model-specific importance indices as causal effects. A non-converged logistic fit is marked in the metrics and supplementary output rather than silently interpreted. The duplicate `year` column is de-duplicated during model-sample construction.
+
+### Analysis output interpretation
+
+- `logistic_coefficients.csv`: inferential Logistic Regression estimates, odds ratios, standard errors, p-values, and 95% OR confidence intervals. These are association estimates, not predictive scores.
+- `model_metrics.csv`: inferential model summaries plus grouped-CV predictive summaries. Logistic rows contain sample and fit statistics; predictive rows contain fold-aggregated AP, Brier, ROC-AUC, and specification comparisons.
+- `support_hypothesis_coefficients.csv`: coefficient-level results for H2, H3, and exploratory Minor-to-War models. H2 rows additionally include Benjamini–Hochberg-adjusted p-values for support-type terms only.
+- `support_hypothesis_metrics.csv`: sample sizes, outcome counts, estimability, and H3 exclusion metadata for the supplementary hypotheses.
+- `grouped_cv_metrics.csv`: legacy grouped-CV filename retained by older runs; current runs write `grouped_cv_fold_metrics.csv` and `grouped_cv_seed_metrics.csv` to distinguish fold averages from seed-level sensitivity results.
+- `tree_feature_importance.csv`: model-specific tree split importance for predictive interpretation only; it is not an inferential effect estimate.
+- `xgboost_shap_values.csv`: held-out Extended XGBoost SHAP contributions with fold, dyad, and year identifiers. SHAP describes model predictions, not causal effects.
+- `xgboost_shap_importance.csv`: mean absolute held-out SHAP magnitude by feature, summarizing predictive contribution rather than statistical significance.
 - `data/interim/`: standardized source extracts and support feature table
 - `reports/data_audit/`: region decisions, sample flow, schema profile, duplicate keys, unmatched IDs, ESD DY/TY discrepancies, crosswalk issues, missingness, and run summary
 

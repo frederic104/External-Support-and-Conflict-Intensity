@@ -33,8 +33,8 @@ project:
   use_location_fallback_for_region: false
 
 files:
-  # These paths describe the files currently present in data/raw.  They are
-  # inspected by the preflight gate below; presence does not authorize a
+  # These are the required local UCDP v18.1 paths. The preflight gate checks
+  # their declarations before any join; presence does not authorize a
   # cross-version merge.
   dyadic: "data/raw/ucdp/ucdp-dyadic-181.csv"
   esd_ty: "data/raw/ucdp/ucdp-esd-ty-181.csv"
