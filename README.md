@@ -161,7 +161,8 @@ The analysis also writes publication-style PDF and PNG figures: logistic odds-ra
 - `grouped_cv_predictions.csv`: held-out prediction rows for every successful estimator-seed/fold/split combination.
 - `grouped_cv_conflict_overlap.csv`: train/test conflict counts and shared conflict IDs for each grouped-CV fold. Shared conflicts are expected under dyad grouping and are diagnostic only.
 - `tree_feature_importance.csv`: model-specific tree split importance for predictive interpretation only; it is not an inferential effect estimate.
-- `xgboost_shap_values.csv`: held-out Extended XGBoost SHAP contributions with fold, dyad, and year identifiers. SHAP describes model predictions, not causal effects.
+- `xgboost_shap_values.csv`: held-out Extended XGBoost SHAP attribution values with fold, dyad, and `observation_year` identifiers. The feature column `year` remains an attribution column; SHAP values are on the model's raw predicted log-odds scale and describe prediction, not causal effects.
+- `xgboost_shap_feature_values.csv`: original held-out feature values aligned row-for-row and column-for-column with `xgboost_shap_values.csv`; it is supplied as the feature-data matrix to the beeswarm plot.
 - `xgboost_shap_importance.csv`: mean absolute held-out SHAP magnitude by feature, summarizing predictive contribution rather than statistical significance.
 - `data/interim/`: standardized source extracts and support feature table
 - `reports/data_audit/`: region decisions, sample flow, schema profile, duplicate keys, unmatched IDs, ESD DY/TY discrepancies, crosswalk issues, missingness, and run summary

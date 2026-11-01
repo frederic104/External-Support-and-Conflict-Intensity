@@ -258,7 +258,10 @@ def save_plots(output_dir: Path, coefficients: pd.DataFrame,
                           max_display=min(10, shap_features.shape[1]))
         fig = plt.gcf()
         fig.set_size_inches(8, 6)
-        plt.title("XGBoost SHAP beeswarm\n(right = higher predicted war probability)")
+        plt.title(
+            "XGBoost SHAP beeswarm\n"
+            "SHAP contributions to predicted log-odds of War-level intensity"
+        )
         fig.tight_layout()
         fig.savefig(output_dir / "xgboost_shap_beeswarm.pdf", bbox_inches="tight")
         fig.savefig(output_dir / "xgboost_shap_beeswarm.png", bbox_inches="tight")
@@ -924,6 +927,23 @@ def _predictive_estimator(model_name: str, seed: int) -> Any:
     )
 
 
+def _validate_shap_alignment(
+    attributions: pd.DataFrame, feature_values: pd.DataFrame,
+    features: list[str],
+) -> None:
+    metadata = ["fold", "dyad_id", "observation_year"]
+    expected = metadata + features
+    if list(attributions.columns) != expected or list(feature_values.columns) != expected:
+        raise ValueError("SHAP and feature-value columns do not match the expected order.")
+    if attributions.shape != feature_values.shape:
+        raise ValueError("SHAP and feature-value matrices have different dimensions.")
+    keys = ["dyad_id", "observation_year"]
+    if attributions[keys].duplicated().any() or feature_values[keys].duplicated().any():
+        raise ValueError("Duplicate dyad-year keys found in SHAP outputs.")
+    if not attributions[keys].equals(feature_values[keys]):
+        raise ValueError("SHAP and feature-value observation keys are misaligned.")
+
+
 def grouped_cross_validation(
     sample: pd.DataFrame, output_dir: Path, random_state: int, n_splits: int,
     split_seeds: list[int] | None = None,
@@ -939,7 +959,8 @@ def grouped_cross_validation(
     folds: list[dict[str, Any]] = []
     prediction_rows: list[dict[str, Any]] = []
     overlap_rows: list[dict[str, Any]] = []
-    shap_rows: list[pd.DataFrame] = []
+    shap_attribution_rows: list[pd.DataFrame] = []
+    shap_feature_rows: list[pd.DataFrame] = []
     importance_rows: list[dict[str, Any]] = []
     estimator_seeds = [
         random_state + 100_003,
@@ -1038,14 +1059,21 @@ def grouped_cross_validation(
                                 )
                                 if isinstance(values, list):
                                     values = values[-1]
-                                frame = pd.DataFrame(values, columns=features)
-                                frame.insert(0, "fold", fold_id)
-                                frame.insert(1, "dyad_id", test["dyad_id"].to_numpy())
-                                if "year" not in frame.columns:
-                                    frame.insert(2, "year", test["year"].to_numpy())
-                                else:
-                                    frame.insert(2, "observation_year", test["year"].to_numpy())
-                                shap_rows.append(frame)
+                                metadata = pd.DataFrame({
+                                    "fold": fold_id,
+                                    "dyad_id": test["dyad_id"].to_numpy(),
+                                    "observation_year": test["year"].to_numpy(),
+                                })
+                                attribution_frame = pd.concat([
+                                    metadata.reset_index(drop=True),
+                                    pd.DataFrame(values, columns=features),
+                                ], axis=1)
+                                feature_frame = pd.concat([
+                                    metadata.reset_index(drop=True),
+                                    test[features].reset_index(drop=True),
+                                ], axis=1)
+                                shap_attribution_rows.append(attribution_frame)
+                                shap_feature_rows.append(feature_frame)
                             if hasattr(estimator, "feature_importances_"):
                                 importance_rows.extend(
                                     {"split_repetition": split_repetition,
@@ -1180,11 +1208,31 @@ def grouped_cross_validation(
                 (summaries["model"] == model_name) & (summaries["specification"] == "extended"),
                 "delta_brier_sd_across_repetitions",
             ] = deltas["delta_brier_vs_baseline"].std()
-    shap_values = pd.concat(shap_rows, ignore_index=True) if shap_rows else None
-    if shap_values is not None:
-        shap_features = shap_values[PREDICTIVE_SPECS["extended"]]
-        shap_matrix = shap_features.to_numpy()
+    shap_values = (
+        pd.concat(shap_attribution_rows, ignore_index=True)
+        if shap_attribution_rows else None
+    )
+    original_features = (
+        pd.concat(shap_feature_rows, ignore_index=True)
+        if shap_feature_rows else None
+    )
+    if shap_values is not None and original_features is not None:
+        _validate_shap_alignment(
+            shap_values, original_features, PREDICTIVE_SPECS["extended"]
+        )
+        sample_keys = set(zip(sample["dyad_id"], sample["year"]))
+        shap_keys = set(zip(
+            shap_values["dyad_id"], shap_values["observation_year"]
+        ))
+        if len(shap_values) != len(sample) or shap_keys != sample_keys:
+            raise ValueError(
+                "SHAP export does not contain each selected-repetition observation exactly once."
+            )
+        shap_matrix = shap_values[PREDICTIVE_SPECS["extended"]].to_numpy()
         shap_values.to_csv(output_dir / "xgboost_shap_values.csv", index=False)
+        original_features.to_csv(
+            output_dir / "xgboost_shap_feature_values.csv", index=False
+        )
         pd.DataFrame({
             "feature": PREDICTIVE_SPECS["extended"],
             "mean_abs_shap": np.abs(shap_matrix).mean(axis=0),
@@ -1197,7 +1245,10 @@ def grouped_cross_validation(
     return summaries.to_dict("records"), (
         shap_values[PREDICTIVE_SPECS["extended"]].to_numpy()
         if shap_values is not None else None
-    ), (shap_values[PREDICTIVE_SPECS["extended"]] if shap_values is not None else None)
+    ), (
+        original_features[PREDICTIVE_SPECS["extended"]]
+        if original_features is not None else None
+    )
 
 
 def fit_predictive_models(

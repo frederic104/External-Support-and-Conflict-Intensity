@@ -440,6 +440,13 @@ class TestAnalysisPolicy(unittest.TestCase):
                 output_dir / "grouped_cv_conflict_overlap.csv"
             )
             predictions = pd.read_csv(output_dir / "grouped_cv_predictions.csv")
+            shap_values = pd.read_csv(output_dir / "xgboost_shap_values.csv")
+            feature_values = pd.read_csv(
+                output_dir / "xgboost_shap_feature_values.csv"
+            )
+            importance = pd.read_csv(
+                output_dir / "xgboost_shap_importance.csv"
+            )
 
         self.assertEqual(set(seed["split_seed"]), {7, 17})
         self.assertEqual(set(repetitions["split_seed"]), {7, 17})
@@ -460,6 +467,27 @@ class TestAnalysisPolicy(unittest.TestCase):
             {"split_repetition", "split_seed", "fold", "predicted_probability"}
             <= set(predictions)
         )
+        self.assertEqual(shap_values.shape, feature_values.shape)
+        self.assertEqual(
+            list(shap_values.columns), list(feature_values.columns)
+        )
+        self.assertEqual(
+            set(zip(shap_values["dyad_id"], shap_values["observation_year"])),
+            set(zip(feature_values["dyad_id"], feature_values["observation_year"])),
+        )
+        self.assertEqual(len(shap_values), len(sample))
+        expected_importance = dict(zip(
+            analyze_models.PREDICTIVE_SPECS["extended"],
+            np.abs(
+                shap_values[analyze_models.PREDICTIVE_SPECS["extended"]]
+                .to_numpy()
+            ).mean(axis=0),
+        ))
+        self.assertEqual(set(importance["feature"]), set(expected_importance))
+        for row in importance.itertuples():
+            self.assertAlmostEqual(
+                row.mean_abs_shap, expected_importance[row.feature], places=6
+            )
         for split_seed in [7, 17]:
             split = folds[folds["split_seed"] == split_seed]
             for fold_id in split["fold"].unique():
@@ -479,3 +507,53 @@ class TestAnalysisPolicy(unittest.TestCase):
                 )
                 outputs.append(pd.read_csv(Path(directory) / "grouped_cv_conflict_overlap.csv"))
         pd.testing.assert_frame_equal(outputs[0], outputs[1])
+
+    def test_shap_and_feature_value_matrices_preserve_keys_and_feature_order(self):
+        features = analyze_models.PREDICTIVE_SPECS["extended"]
+        metadata = pd.DataFrame({
+            "fold": [1, 2],
+            "dyad_id": [10, 11],
+            "observation_year": [2000, 2001],
+        })
+        values = pd.DataFrame(np.arange(2 * len(features)).reshape(2, -1), columns=features)
+        attributions = pd.concat([metadata, values], axis=1)
+        original = pd.concat([metadata, values + 100], axis=1)
+        analyze_models._validate_shap_alignment(attributions, original, features)
+        pd.testing.assert_frame_equal(
+            attributions[["dyad_id", "observation_year"]],
+            original[["dyad_id", "observation_year"]],
+        )
+        self.assertEqual(
+            attributions[features].shape,
+            original[features].shape,
+        )
+
+    def test_shap_alignment_rejects_duplicate_observation_keys(self):
+        features = analyze_models.PREDICTIVE_SPECS["extended"]
+        frame = pd.DataFrame({
+            "fold": [1, 2],
+            "dyad_id": [10, 10],
+            "observation_year": [2000, 2000],
+        })
+        for feature in features:
+            frame[feature] = [0.0, 1.0]
+        with self.assertRaises(ValueError):
+            analyze_models._validate_shap_alignment(frame, frame.copy(), features)
+
+    def test_shap_plot_receives_original_feature_values(self):
+        features = analyze_models.PREDICTIVE_SPECS["extended"]
+        shap_values = np.ones((2, len(features)))
+        original = pd.DataFrame(np.arange(2 * len(features)).reshape(2, -1), columns=features)
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(analyze_models.shap, "summary_plot") as summary_plot:
+                analyze_models.save_plots(
+                    Path(tmp), pd.DataFrame({"term": []}),
+                    pd.DataFrame({"method": []}),
+                    make_analysis_sample(4),
+                    shap_values, original,
+                )
+        summary_plot.assert_called_once()
+        args, kwargs = summary_plot.call_args
+        np.testing.assert_array_equal(args[0], shap_values)
+        pd.testing.assert_frame_equal(args[1], original)
+        self.assertEqual(kwargs["max_display"], len(features))
