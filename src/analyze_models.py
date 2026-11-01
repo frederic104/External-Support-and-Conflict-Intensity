@@ -481,7 +481,7 @@ def _predictive_estimator(model_name: str, seed: int) -> Any:
         return make_pipeline(
             StandardScaler(),
             LogisticRegression(
-                penalty="l2", C=1.0, solver="liblinear",
+                C=1.0, solver="liblinear",
                 max_iter=1000, random_state=seed,
             ),
         )
