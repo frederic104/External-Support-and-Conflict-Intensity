@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import warnings
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +20,7 @@ from sklearn.model_selection import StratifiedGroupKFold
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 from statsmodels.stats.multitest import multipletests
+from statsmodels.tools.sm_exceptions import ConvergenceWarning
 from xgboost import XGBClassifier
 import shap
 
@@ -222,6 +224,54 @@ def _ci_status(lower: float, upper: float) -> str:
     return "finite" if np.isfinite(lower) and np.isfinite(upper) else "unbounded"
 
 
+def _inference_rows(
+    model_name: str, hypothesis: str, terms: list[str], n: int,
+    converged: bool, reason: str | None,
+) -> list[dict[str, Any]]:
+    status = "valid" if reason is None and converged else "non_estimable"
+    return [{
+        "model": model_name,
+        "hypothesis": hypothesis,
+        "term": term,
+        "estimate": np.nan,
+        "odds_ratio": np.nan,
+        "or_ci_lower": np.nan,
+        "or_ci_upper": np.nan,
+        "ci_status": "not_available",
+        "std_error": np.nan,
+        "p_value": np.nan,
+        "n": n,
+        "converged": converged,
+        "inference_status": status,
+        "inference_error": reason or "",
+    } for term in terms]
+
+
+def _inference_diagnostics(
+    fit: Any, captured_warnings: list[warnings.WarningMessage],
+) -> tuple[bool, str]:
+    converged = bool(fit.mle_retvals.get("converged", False))
+    if not converged:
+        return False, "maximum_likelihood_not_converged"
+    arrays = {
+        "parameters": np.asarray(fit.params, dtype=float),
+        "standard_errors": np.asarray(fit.bse, dtype=float),
+        "p_values": np.asarray(fit.pvalues, dtype=float),
+    }
+    invalid = [name for name, values in arrays.items() if not np.isfinite(values).all()]
+    if invalid:
+        return False, f"non_finite_{'_'.join(invalid)}"
+    numerical = [
+        warning for warning in captured_warnings
+        if issubclass(warning.category, (RuntimeWarning, ConvergenceWarning))
+    ]
+    if numerical:
+        return False, "numerical_warning:" + "; ".join(
+            str(warning.message) for warning in numerical
+        )
+    return True, ""
+
+
 def _fit_logit_sample(
     sample: pd.DataFrame, features: list[str], model_name: str,
     sample_specification: str,
@@ -300,16 +350,36 @@ def _fit_binary_specification(
     X = sm.add_constant(sample[features], has_constant="add")
     y = sample[outcome].astype(int)
     try:
-        fit = sm.Logit(y, X).fit(
-            disp=False, maxiter=200, cov_type="cluster",
-            cov_kwds={"groups": sample["dyad_id"]},
-            warn_convergence=False,
-        )
+        with warnings.catch_warnings(record=True) as captured_warnings:
+            warnings.simplefilter("always")
+            fit = sm.Logit(y, X).fit(
+                disp=False, maxiter=200, cov_type="cluster",
+                cov_kwds={"groups": sample["dyad_id"]},
+                warn_convergence=False,
+            )
     except (ValueError, np.linalg.LinAlgError, FloatingPointError) as exc:
-        return [], {"model": model_name, "hypothesis": hypothesis, "status": "failed",
-                    "n": len(sample), "error": str(exc)}
+        terms = list(X.columns)
+        return _inference_rows(
+            model_name, hypothesis, terms, len(sample), False, f"fit_failed:{exc}",
+        ), {"model": model_name, "hypothesis": hypothesis, "status": "non_estimable",
+            "n": len(sample), "error": str(exc), "converged": False,
+            "inference_error": f"fit_failed:{exc}"}
     converged = bool(fit.mle_retvals.get("converged", True))
+    estimable, reason = _inference_diagnostics(fit, captured_warnings)
     ci = fit.conf_int()
+    if not estimable:
+        terms = list(fit.params.index)
+        metric = {
+            "model": model_name, "hypothesis": hypothesis,
+            "status": "non_estimable", "n": len(sample),
+            "pseudo_r2": np.nan, "aic": np.nan, "converged": converged,
+            "warning": reason, "inference_error": reason,
+        }
+        if extra_metric:
+            metric.update(extra_metric)
+        return _inference_rows(
+            model_name, hypothesis, terms, len(sample), converged, reason,
+        ), metric
     rows = [{
         "model": model_name,
         "hypothesis": hypothesis,
@@ -325,6 +395,8 @@ def _fit_binary_specification(
         "p_value": float(pvalue),
         "n": len(sample),
         "converged": converged,
+        "inference_status": "valid",
+        "inference_error": "",
     } for term, estimate, stderr, pvalue in zip(
         fit.params.index, fit.params, fit.bse, fit.pvalues
     )]
@@ -333,7 +405,8 @@ def _fit_binary_specification(
         "status": "ok" if converged else "nonconverged",
         "n": len(sample), "pseudo_r2": float(fit.prsquared), "aic": float(fit.aic),
         "converged": converged,
-        "warning": "" if converged else "maximum_likelihood_not_converged",
+        "warning": "",
+        "inference_error": "",
     }
     if extra_metric:
         metric.update(extra_metric)
@@ -370,15 +443,35 @@ def fit_support_hypotheses(df: pd.DataFrame, output_dir: Path) -> None:
     metric_rows.append(metric)
     h2_rows = [row for row in coefficient_rows
                if row["hypothesis"] == "support_type"
-               and row["term"] in SUPPORT_TYPE_FEATURES]
+               and row["term"] in SUPPORT_TYPE_FEATURES
+               and row.get("inference_status") == "valid"
+               and np.isfinite(row.get("p_value", np.nan))]
+    h2_metrics = [row for row in metric_rows if row["hypothesis"] == "support_type"]
+    valid_models = {
+        row["model"] for row in h2_metrics if row.get("status") == "ok"
+    }
+    attempted_h2 = len(h2_metrics)
+    valid_h2 = len(valid_models)
+    non_estimable_h2 = attempted_h2 - valid_h2
+    for metric in h2_metrics:
+        metric.update({
+            "h2_attempted": attempted_h2,
+            "h2_valid": valid_h2,
+            "h2_non_estimable": non_estimable_h2,
+            "h2_fdr_family_size": len(h2_rows),
+        })
     if h2_rows:
         _, corrected, _, _ = multipletests(
             [row["p_value"] for row in h2_rows], method="fdr_bh"
         )
         correction = {row["term"]: float(value) for row, value in zip(h2_rows, corrected)}
         for row in coefficient_rows:
-            if row["hypothesis"] == "support_type" and row["term"] in correction:
+            if (row["hypothesis"] == "support_type"
+                    and row["term"] in correction
+                    and row.get("model") in valid_models):
                 row["p_value_fdr_bh"] = correction[row["term"]]
+            elif row["hypothesis"] == "support_type":
+                row["p_value_fdr_bh"] = np.nan
 
     escalation = df[df["lag_intensity"].eq(1)].copy()
     rows, metric = _fit_binary_specification(

@@ -153,8 +153,8 @@ The analysis also writes publication-style PDF and PNG figures: logistic odds-ra
 
 - `logistic_coefficients.csv`: inferential Logistic Regression estimates, odds ratios, standard errors, p-values, and 95% OR confidence intervals. These are association estimates, not predictive scores.
 - `model_metrics.csv`: inferential model summaries plus grouped-CV predictive summaries. Logistic rows contain sample and fit statistics; predictive rows contain fold-aggregated AP, Brier, ROC-AUC, and specification comparisons.
-- `support_hypothesis_coefficients.csv`: coefficient-level results for H2, H3, and exploratory Minor-to-War models. H2 rows additionally include Benjamini–Hochberg-adjusted p-values for support-type terms only.
-- `support_hypothesis_metrics.csv`: sample sizes, outcome counts, estimability, and H3 exclusion metadata for the supplementary hypotheses.
+- `support_hypothesis_coefficients.csv`: coefficient-level results for H2, H3, and exploratory Minor-to-War models. H2 rows additionally include Benjamini–Hochberg-adjusted p-values for valid support-type terms only; non-estimable models retain diagnostic rows with inferential values set to missing.
+- `support_hypothesis_metrics.csv`: sample sizes, outcome counts, convergence and estimability diagnostics, H2 attempted/valid/non-estimable counts, and H3 exclusion metadata for the supplementary hypotheses. The H2 correction family contains only estimable support-type tests.
 - `grouped_cv_metrics.csv`: legacy grouped-CV filename retained by older runs; current runs write `grouped_cv_fold_metrics.csv` and `grouped_cv_seed_metrics.csv` to distinguish fold averages from seed-level sensitivity results.
 - `tree_feature_importance.csv`: model-specific tree split importance for predictive interpretation only; it is not an inferential effect estimate.
 - `xgboost_shap_values.csv`: held-out Extended XGBoost SHAP contributions with fold, dyad, and year identifiers. SHAP describes model predictions, not causal effects.
