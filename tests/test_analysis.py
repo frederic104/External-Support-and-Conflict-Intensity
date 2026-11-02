@@ -230,6 +230,9 @@ class TestAnalysisPolicy(unittest.TestCase):
             average_predictions = pd.read_csv(
                 output_dir / "h1_quadratic_average_predictions.csv"
             )
+            distribution = pd.read_csv(
+                output_dir / "h1_breadth_distribution_by_conflict.csv"
+            )
             predictions = pd.read_csv(
                 output_dir / "h1_functional_form_predictions.csv"
             )
@@ -250,10 +253,15 @@ class TestAnalysisPolicy(unittest.TestCase):
             set(df["conflict_id"].unique()),
         )
         self.assertTrue({
-            "quadratic_term_test_p_value", "joint_test_p_value", "status"
+        "breadth_mean", "quadratic_term_test_p_value", "joint_test_p_value", "status"
         } <= set(quadratic_loo))
         self.assertEqual(
             list(average_predictions["breadth"]), list(range(10))
+        )
+        self.assertEqual(distribution["n"].sum(), len(df))
+        self.assertEqual(distribution["war_n"].sum(), int(df["war_t"].sum()))
+        self.assertEqual(
+            distribution["minor_n"].sum(), int((df["war_t"] == 0).sum())
         )
         self.assertEqual(
             set(loo["excluded_conflict_id"]),
