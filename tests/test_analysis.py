@@ -224,6 +224,12 @@ class TestAnalysisPolicy(unittest.TestCase):
             quadratic = pd.read_csv(output_dir / "h1_quadratic_coefficients.csv")
             conflict = pd.read_csv(output_dir / "h1_conflict_summary.csv")
             loo = pd.read_csv(output_dir / "h1_leave_one_conflict_out.csv")
+            quadratic_loo = pd.read_csv(
+                output_dir / "h1_quadratic_leave_one_conflict_out.csv"
+            )
+            average_predictions = pd.read_csv(
+                output_dir / "h1_quadratic_average_predictions.csv"
+            )
             predictions = pd.read_csv(
                 output_dir / "h1_functional_form_predictions.csv"
             )
@@ -238,6 +244,17 @@ class TestAnalysisPolicy(unittest.TestCase):
         self.assertIn("breadth_centered_sq", set(quadratic["term"]))
         self.assertEqual(len(conflict), df["conflict_id"].nunique())
         self.assertEqual(len(loo), df["conflict_id"].nunique())
+        self.assertEqual(len(quadratic_loo), df["conflict_id"].nunique())
+        self.assertEqual(
+            set(quadratic_loo["excluded_conflict_id"]),
+            set(df["conflict_id"].unique()),
+        )
+        self.assertTrue({
+            "quadratic_term_test_p_value", "joint_test_p_value", "status"
+        } <= set(quadratic_loo))
+        self.assertEqual(
+            list(average_predictions["breadth"]), list(range(10))
+        )
         self.assertEqual(
             set(loo["excluded_conflict_id"]),
             set(df["conflict_id"].unique()),
@@ -256,6 +273,23 @@ class TestAnalysisPolicy(unittest.TestCase):
         )
         self.assertNotIn("breadth_centered", analyze_models.MODEL_FEATURES["M1"])
         self.assertNotIn("breadth_centered_sq", analyze_models.MODEL_FEATURES["M1"])
+
+    def test_quadratic_curvature_tests_and_turning_point_are_explicit(self):
+        df = make_analysis_sample(60)
+        with tempfile.TemporaryDirectory() as tmp:
+            metrics = analyze_models.fit_h1_sensitivity(df, Path(tmp))
+            quadratic_metrics = pd.read_csv(Path(tmp) / "h1_quadratic_metrics.csv")
+        metric = metrics[0]
+        self.assertEqual(metric["quadratic_term_test_df"], 1)
+        self.assertEqual(metric["joint_test_df"], 2)
+        self.assertEqual(
+            metric["inference_method"], "cluster-robust Wald test by dyad"
+        )
+        self.assertEqual(
+            quadratic_metrics.loc[0, "quadratic_term_test_df"], 1
+        )
+        self.assertEqual(quadratic_metrics.loc[0, "joint_test_df"], 2)
+        self.assertTrue(np.isfinite(metric["turning_point"]))
 
     def test_h1_leave_one_conflict_out_records_failed_fits(self):
         df = make_analysis_sample(18)
