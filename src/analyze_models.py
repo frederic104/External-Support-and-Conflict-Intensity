@@ -445,9 +445,19 @@ def fit_h1_sensitivity(df: pd.DataFrame, output_dir: Path) -> list[dict[str, Any
         "breadth_mean": mean_breadth,
         "breadth_centered_mean": float(sample["breadth_centered"].mean()),
         "breadth_centered_sq_mean": float(sample["breadth_centered_sq"].mean()),
-        "joint_test": _quadratic_joint_test(sample, quadratic_features),
+        **_quadratic_wald_tests(sample, quadratic_features),
+        "turning_point": _turning_point(rows, mean_breadth),
+        "interpretation": (
+            "Exploratory quadratic functional-form analysis; primary linear H1 remains unchanged."
+        ),
         "sensitivity_role": "exploratory_functional_form",
     })
+    metric["joint_test"] = {
+        "status": "ok" if np.isfinite(metric["joint_test_p_value"]) else "non_estimable",
+        "statistic": metric["joint_test_statistic"],
+        "p_value": metric["joint_test_p_value"],
+        "df": metric["joint_test_df"],
+    }
     pd.DataFrame(rows).to_csv(
         output_dir / "h1_quadratic_coefficients.csv", index=False
     )
@@ -472,8 +482,25 @@ def fit_h1_sensitivity(df: pd.DataFrame, output_dir: Path) -> list[dict[str, Any
     ).reset_index()
     observed.to_csv(output_dir / "h1_breadth_observed.csv", index=False)
     _write_h1_predictions(sample, output_dir, quadratic_features, mean_breadth)
+    _write_h1_average_predictions(sample, output_dir, quadratic_features, mean_breadth)
+
+    distribution = sample.assign(
+        breadth_group=pd.cut(
+            sample[breadth], bins=[-1, 2, 5, 9],
+            labels=["0-2", "3-5", "6-9"],
+        )
+    ).groupby(["conflict_id", "breadth_group"], observed=False).agg(
+        n=("war_t", "size"),
+        war_n=("war_t", "sum"),
+    ).reset_index()
+    distribution["minor_n"] = distribution["n"] - distribution["war_n"]
+    distribution["war_proportion"] = distribution["war_n"] / distribution["n"].replace(0, np.nan)
+    distribution.to_csv(
+        output_dir / "h1_breadth_distribution_by_conflict.csv", index=False
+    )
 
     loo_rows: list[dict[str, Any]] = []
+    quadratic_loo_rows: list[dict[str, Any]] = []
     for conflict_id in sample["conflict_id"].drop_duplicates():
         loo = sample[sample["conflict_id"] != conflict_id].copy()
         fit_rows, fit_metric = _fit_binary_specification(
@@ -503,9 +530,50 @@ def fit_h1_sensitivity(df: pd.DataFrame, output_dir: Path) -> list[dict[str, Any
             "status": fit_metric.get("status", "non_estimable"),
             "inference_error": fit_metric.get("inference_error", ""),
         })
+        quadratic_loo = sample[sample["conflict_id"] != conflict_id].copy()
+        quadratic_mean = float(quadratic_loo[breadth].mean())
+        quadratic_loo["breadth_centered"] = quadratic_loo[breadth] - quadratic_mean
+        quadratic_loo["breadth_centered_sq"] = quadratic_loo["breadth_centered"] ** 2
+        quadratic_rows, quadratic_metric = _fit_binary_specification(
+            quadratic_loo, quadratic_features, "war_t",
+            "H1_quadratic_leave_one_conflict_out", "h1_conflict_sensitivity",
+        )
+        quadratic_metric.update(_quadratic_wald_tests(quadratic_loo, quadratic_features))
+        linear_target = next(
+            (row for row in quadratic_rows if row["term"] == "breadth_centered"),
+            {},
+        )
+        square_target = next(
+            (row for row in quadratic_rows if row["term"] == "breadth_centered_sq"),
+            {},
+        )
+        quadratic_loo_rows.append({
+            "excluded_conflict_id": conflict_id,
+            "n": len(quadratic_loo),
+            "war_n": int(quadratic_loo["war_t"].sum()),
+            "minor_n": int((quadratic_loo["war_t"] == 0).sum()),
+            "unique_dyads": int(quadratic_loo["dyad_id"].nunique()),
+            "unique_conflicts": int(quadratic_loo["conflict_id"].nunique()),
+            "breadth_linear_estimate": linear_target.get("estimate", np.nan),
+            "breadth_linear_p_value": linear_target.get("p_value", np.nan),
+            "breadth_sq_estimate": square_target.get("estimate", np.nan),
+            "breadth_sq_odds_ratio": square_target.get("odds_ratio", np.nan),
+            "breadth_sq_or_ci_lower": square_target.get("or_ci_lower", np.nan),
+            "breadth_sq_or_ci_upper": square_target.get("or_ci_upper", np.nan),
+            "quadratic_term_test_p_value": quadratic_metric.get(
+                "quadratic_term_test_p_value", np.nan
+            ),
+            "joint_test_p_value": quadratic_metric.get("joint_test_p_value", np.nan),
+            "converged": quadratic_metric.get("converged", False),
+            "warning": quadratic_metric.get("warning", quadratic_metric.get("error", "")),
+            "status": quadratic_metric.get("status", "non_estimable"),
+        })
     loo_frame = pd.DataFrame(loo_rows)
     loo_frame.to_csv(
         output_dir / "h1_leave_one_conflict_out.csv", index=False
+    )
+    pd.DataFrame(quadratic_loo_rows).to_csv(
+        output_dir / "h1_quadratic_leave_one_conflict_out.csv", index=False
     )
     loo_summary = {
         "model": "H1_leave_one_conflict_out",
@@ -563,6 +631,106 @@ def _write_h1_predictions(
     pd.DataFrame(rows).to_csv(
         output_dir / "h1_functional_form_predictions.csv", index=False
     )
+
+
+def _write_h1_average_predictions(
+    sample: pd.DataFrame, output_dir: Path, features: list[str], mean_breadth: float,
+) -> None:
+    breadth = "n_support_types_confirmed"
+    rows: list[dict[str, Any]] = []
+    try:
+        X = sm.add_constant(sample[features], has_constant="add")
+        with warnings.catch_warnings(record=True) as captured:
+            warnings.simplefilter("always")
+            fit = sm.Logit(sample["war_t"].astype(int), X).fit(
+                disp=False, maxiter=200, cov_type="cluster",
+                cov_kwds={"groups": sample["dyad_id"]}, warn_convergence=False,
+            )
+        estimable, _ = _inference_diagnostics(fit, captured)
+        if estimable:
+            for value in range(10):
+                prediction_data = sample[MODEL_FEATURES["M0"]].copy()
+                centered = value - mean_breadth
+                prediction_data["breadth_centered"] = centered
+                prediction_data["breadth_centered_sq"] = centered ** 2
+                probabilities = fit.predict(sm.add_constant(
+                    prediction_data[features], has_constant="add"
+                ))
+                rows.append({
+                    "breadth": value,
+                    "n_observations_at_breadth": int((sample[breadth] == value).sum()),
+                    "average_predicted_probability": float(probabilities.mean()),
+                })
+    except (ValueError, np.linalg.LinAlgError, FloatingPointError):
+        rows = []
+    pd.DataFrame(rows).to_csv(
+        output_dir / "h1_quadratic_average_predictions.csv", index=False
+    )
+
+
+def _turning_point(rows: list[dict[str, Any]], mean_breadth: float) -> float:
+    linear = next(
+        (row.get("estimate", np.nan) for row in rows
+         if row.get("term") == "breadth_centered"),
+        np.nan,
+    )
+    quadratic = next(
+        (row.get("estimate", np.nan) for row in rows
+         if row.get("term") == "breadth_centered_sq"),
+        np.nan,
+    )
+    if not np.isfinite(linear) or not np.isfinite(quadratic) or quadratic == 0:
+        return np.nan
+    return float(mean_breadth - linear / (2 * quadratic))
+
+
+def _quadratic_wald_tests(sample: pd.DataFrame, features: list[str]) -> dict[str, Any]:
+    X = sm.add_constant(sample[features], has_constant="add")
+    y = sample["war_t"].astype(int)
+    n_clusters = int(sample["dyad_id"].nunique())
+    base = {
+        "inference_method": "cluster-robust Wald test by dyad",
+        "n_clusters": n_clusters,
+        "quadratic_term_test_statistic": np.nan,
+        "quadratic_term_test_p_value": np.nan,
+        "quadratic_term_test_df": 1,
+        "joint_test_statistic": np.nan,
+        "joint_test_p_value": np.nan,
+        "joint_test_df": 2,
+    }
+    try:
+        with warnings.catch_warnings(record=True) as captured:
+            warnings.simplefilter("always")
+            fit = sm.Logit(y, X).fit(
+                disp=False, maxiter=200, cov_type="cluster",
+                cov_kwds={"groups": sample["dyad_id"]}, warn_convergence=False,
+            )
+        estimable, reason = _inference_diagnostics(fit, captured)
+        if not estimable:
+            return {**base, "quadratic_term_test_error": reason, "joint_test_error": reason}
+        names = list(fit.params.index)
+        quadratic_restriction = np.zeros((1, len(names)))
+        quadratic_restriction[0, names.index("breadth_centered_sq")] = 1
+        linear_restriction = np.zeros((1, len(names)))
+        linear_restriction[0, names.index("breadth_centered")] = 1
+        joint_restriction = np.vstack([linear_restriction, quadratic_restriction])
+        quadratic_test = fit.wald_test(quadratic_restriction, scalar=True)
+        joint_test = fit.wald_test(joint_restriction, scalar=True)
+        return {
+            **base,
+            "quadratic_term_test_statistic": float(quadratic_test.statistic),
+            "quadratic_term_test_p_value": float(quadratic_test.pvalue),
+            "joint_test_statistic": float(joint_test.statistic),
+            "joint_test_p_value": float(joint_test.pvalue),
+            "quadratic_term_test_error": "",
+            "joint_test_error": "",
+        }
+    except (ValueError, np.linalg.LinAlgError, FloatingPointError) as exc:
+        return {
+            **base,
+            "quadratic_term_test_error": str(exc),
+            "joint_test_error": str(exc),
+        }
 
 
 def _quadratic_joint_test(sample: pd.DataFrame, features: list[str]) -> dict[str, Any]:
