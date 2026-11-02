@@ -493,8 +493,14 @@ def fit_h1_sensitivity(df: pd.DataFrame, output_dir: Path) -> list[dict[str, Any
         n=("war_t", "size"),
         war_n=("war_t", "sum"),
     ).reset_index()
+    distribution["n"] = distribution["n"].fillna(0).astype(int)
+    distribution["war_n"] = distribution["war_n"].fillna(0).astype(int)
     distribution["minor_n"] = distribution["n"] - distribution["war_n"]
-    distribution["war_proportion"] = distribution["war_n"] / distribution["n"].replace(0, np.nan)
+    distribution["war_proportion"] = np.where(
+        distribution["n"] > 0,
+        distribution["war_n"] / distribution["n"],
+        0.0,
+    )
     distribution.to_csv(
         output_dir / "h1_breadth_distribution_by_conflict.csv", index=False
     )
@@ -554,6 +560,7 @@ def fit_h1_sensitivity(df: pd.DataFrame, output_dir: Path) -> list[dict[str, Any
             "minor_n": int((quadratic_loo["war_t"] == 0).sum()),
             "unique_dyads": int(quadratic_loo["dyad_id"].nunique()),
             "unique_conflicts": int(quadratic_loo["conflict_id"].nunique()),
+            "breadth_mean": quadratic_mean,
             "breadth_linear_estimate": linear_target.get("estimate", np.nan),
             "breadth_linear_p_value": linear_target.get("p_value", np.nan),
             "breadth_sq_estimate": square_target.get("estimate", np.nan),
